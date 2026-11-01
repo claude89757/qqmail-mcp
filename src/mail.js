@@ -676,8 +676,20 @@ export async function sendDraft(ctx, args) {
       let draft_removed = true;
       if (!args.keep_draft) {
         await s.open("drafts", { write: true });
-        await s.uidStore([uid], "+", ["\\Deleted"]);
-        cleanup = await s.uidExpunge([uid]);
+        // Prefer COPY/MOVE to Trash then verified source cleanup (QQ Drafts EXPUNGE is flaky).
+        let moved = null;
+        try {
+          const trash = await s.resolveFolder("trash");
+          if (trash) moved = await s.uidMove([uid], trash);
+        } catch {
+          moved = null;
+        }
+        if (moved) {
+          cleanup = moved;
+        } else {
+          await s.uidStore([uid], "+", ["\\Deleted"]);
+          cleanup = await s.uidExpunge([uid]);
+        }
         draft_removed = !!cleanup.expunged;
         if (!draft_removed) {
           const rows = await s.uidFetch([uid], "UID FLAGS");
@@ -688,7 +700,19 @@ export async function sendDraft(ctx, args) {
               cleanup = {
                 ...cleanup,
                 note:
-                  "Draft flagged \\Deleted but not expunged (QQ Mail often cannot EXPUNGE without UIDPLUS). Hidden from default search listings.",
+                  "Draft flagged \Deleted but not expunged (QQ Mail often cannot EXPUNGE without UIDPLUS). Hidden from default search listings.",
+              };
+            }
+          } else {
+            // Last resort: mark deleted so listings hide it.
+            await s.uidStore([uid], "+", ["\\Deleted"]).catch(() => {});
+            const rows2 = await s.uidFetch([uid], "UID FLAGS");
+            if (rows2.has(uid) && flagsOf(rows2.get(uid)).deleted) {
+              draft_removed = true;
+              cleanup = {
+                ...cleanup,
+                pending_expunge: [uid],
+                note: "Draft could not be expunged; flagged \Deleted and hidden from default search.",
               };
             }
           }
