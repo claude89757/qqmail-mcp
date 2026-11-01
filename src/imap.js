@@ -51,9 +51,18 @@ export class ImapSession {
     const tag = "A" + String(++this.seq).padStart(4, "0");
     const untagged = [];
     let pending = tag + " ";
+    const literalPlus = this.has("LITERAL+");
     for (const p of parts) {
       if (!(p instanceof Uint8Array)) {
         pending += p;
+        continue;
+      }
+      // Prefer non-synchronizing literals when the server advertises LITERAL+
+      // (QQ Mail often completes SEARCH without sending "+" for sync literals).
+      if (literalPlus) {
+        await this.write(pending + "{" + p.length + "+}\r\n");
+        pending = "";
+        await this.write(p);
         continue;
       }
       await this.write(pending + "{" + p.length + "}\r\n");
@@ -100,6 +109,14 @@ export class ImapSession {
     if (!this.caps.size || !this.caps.has("IMAP4REV1")) {
       const c = await this.command("CAPABILITY");
       for (const r of c.untagged) this.readCaps(r[0]);
+    }
+    if (this.has("ENABLE") && (this.has("UTF8=ACCEPT") || this.has("UTF8=ONLY"))) {
+      try {
+        await this.command("ENABLE UTF8=ACCEPT");
+        this.caps.add("UTF8=ACCEPT");
+      } catch {
+        /* QQ may advertise ENABLE without honouring UTF8=ACCEPT */
+      }
     }
   }
 

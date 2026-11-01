@@ -153,7 +153,7 @@ describe("OAuth flow end to end", () => {
     const t = await connectClient(e);
     expect(t.scope).toBe("mail:read mail:modify mail:send");
     const init = await (await rpc(e, t.access_token, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).json();
-    expect(init.result.serverInfo).toMatchObject({ name: "qqmail-mcp", version: "2.0.0" });
+    expect(init.result.serverInfo).toMatchObject({ name: "qqmail-mcp", version: "2.0.1" });
     const list = await (await rpc(e, t.access_token, "tools/list")).json();
     expect(list.result.tools).toHaveLength(TOOLS.length);
   });

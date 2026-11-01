@@ -263,9 +263,38 @@ export async function searchEmails(ctx, args) {
   const limit = intIn(args.limit, 1, LIMITS.searchMax, 10);
   const offset = intIn(args.offset, 0, 1_000_000, 0);
   const criteria = searchCriteria(args);
+  const needle = clean(args.query || args.subject || args.from || args.to || "", 200);
   return withImap(ctx.env, ctx.connect, async (s) => {
     const box = await s.open(args.folder);
-    const ids = await s.uidSearch(...criteria);
+    let ids;
+    try {
+      ids = await s.uidSearch(...criteria);
+    } catch (e) {
+      // QQ Mail often rejects CHARSET UTF-8 / sync literals. Fall back to a recent-window client filter.
+      if (!needle) throw e;
+      const recent = await s.uidSearch("ALL");
+      const window = recent.slice(-Math.min(recent.length, Math.max(limit * 20, 80)));
+      if (!window.length) return { folder: box.name, total: 0, count: 0, offset, results: [], note: "Chinese search fell back to client filter; no messages." };
+      const rows = await s.uidFetch(window, SUMMARY_ITEMS);
+      const matched = window.filter((u) => {
+        if (!rows.has(u)) return false;
+        const row = summary(u, rows.get(u));
+        const hay = `${row.subject}\n${row.from}\n${row.to}`.toLowerCase();
+        return hay.includes(needle.toLowerCase());
+      });
+      const end = Math.max(0, matched.length - offset);
+      const page = matched.slice(Math.max(0, end - limit), end).reverse();
+      const results = page.filter((u) => rows.has(u)).map((u) => summary(u, rows.get(u)));
+      return {
+        folder: box.name,
+        total: matched.length,
+        count: results.length,
+        offset,
+        has_more: end - limit > 0,
+        results,
+        note: "Chinese IMAP SEARCH unavailable on this server; filtered recent subjects/from/to locally.",
+      };
+    }
     const end = Math.max(0, ids.length - offset);
     const page = ids.slice(Math.max(0, end - limit), end).reverse();
     if (!page.length) return { folder: box.name, total: ids.length, count: 0, offset, results: [] };

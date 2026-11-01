@@ -90,7 +90,7 @@ Values can also be set as plain-text variables in the dashboard. `wrangler.jsonc
 1. Before deploying v2, set `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` (and preferably `ACCESS_ALLOWED_EMAILS`). Without them, new authorizations return 503. Existing tokens and refresh tokens are not affected.
 2. `npm run deploy` deploys to the same Worker name (`qqmail-mcp`), custom domain, D1 binding and secrets.
 3. Reconnect ChatGPT, Grok Bot and Cursor to get the new scopes.
-4. Check `GET /health`. It should report `"version":"2.0.0"` and `"access_jwt_verification":true`.
+4. Check `GET /health`. It should report `"version":"2.0.1"` and `"access_jwt_verification":true`.
 
 ### Configuration reference
 
