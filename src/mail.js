@@ -144,7 +144,14 @@ async function loadBodies(s, uid, parts, { wantHtml = true, maxBytes = LIMITS.bo
     const bytes = raw instanceof Uint8Array ? raw : enc.encode(str(raw));
     return decodeText(decodeTransfer(bytes, p.encoding), p.charset || "utf-8");
   };
-  return { text: decode(textPart), html: decode(htmlPart), truncated: chosen.some((p) => p.size > maxBytes) };
+  const text = decode(textPart);
+  // An empty plain alternative must not hide a non-empty HTML body (including old drafts).
+  if (!wantHtml && textPart && htmlPart && !text.trim()) {
+    const extra = (await s.uidFetch([uid], `UID BODY.PEEK[${htmlPart.fetch_section}]<0.${maxBytes}>`)).get(uid) || {};
+    Object.assign(attrs, extra);
+    chosen.push(htmlPart);
+  }
+  return { text, html: decode(htmlPart), truncated: chosen.some((p) => p.size > maxBytes) };
 }
 
 function selfAddress(env) {
@@ -511,7 +518,7 @@ export async function saveDraft(ctx, args) {
   const rcpt = recipientsOf(args, { allowEmpty: true });
   const attachments = attachmentsOf(args.attachments);
   const messageId = newMessageId(ctx.env.QQ_EMAIL);
-  const message = buildMessage({ from: fromHeader(ctx.env), ...rcpt, includeBcc: true, subject: clean(args.subject, 900), text: args.body ?? "", html: args.html, attachments, messageId });
+  const message = buildMessage({ from: fromHeader(ctx.env), ...rcpt, includeBcc: true, subject: clean(args.subject, 900), text: args.body ?? undefined, html: args.html, attachments, messageId });
   return withImap(ctx.env, ctx.connect, async (s) => {
     const drafts = await s.resolveFolder("drafts");
     let uid = await s.append(drafts, enc.encode(message), ["\\Draft", "\\Seen"]);
@@ -591,7 +598,7 @@ export async function replyEmail(ctx, args) {
       let html = args.html;
       if (args.quote_original !== false) {
         const orig = await loadBodies(s, uid, parts, { wantHtml: !!html, maxBytes: 256 * 1024 });
-        const origText = (orig.text || htmlToText(orig.html)).slice(0, 30000);
+        const origText = (orig.text.trim() || htmlToText(orig.html)).slice(0, 30000);
         const intro = `On ${h.date || "an earlier date"}, ${h.from || "the sender"} wrote:`;
         text = `${text}\n\n${intro}\n${quoteText(origText)}`;
         if (html) html = `${html}<br><br><div>${escapeHtml(intro)}</div><blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${orig.html || textToHtml(origText)}</blockquote>`;
@@ -642,7 +649,7 @@ export async function forwardEmail(ctx, args) {
       const orig = await loadBodies(s, uid, parts, { wantHtml: true, maxBytes: 512 * 1024 });
       const block = ["---------- Forwarded message ----------", `From: ${h.from || ""}`, `Date: ${h.date || ""}`, `Subject: ${h.subject || ""}`, `To: ${h.to || ""}`, ...(h.cc ? [`Cc: ${h.cc}`] : [])];
       const note = String(args.body ?? "");
-      const origText = orig.text || htmlToText(orig.html);
+      const origText = orig.text.trim() || htmlToText(orig.html);
       const text = `${note}\n\n${block.join("\n")}\n\n${origText}`;
       const html = orig.html ? `<div>${textToHtml(note)}</div><br><div>${block.map(escapeHtml).join("<br>")}</div><br>${orig.html}` : undefined;
       const rawParts = [];
