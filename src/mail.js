@@ -416,6 +416,7 @@ function cleanupFields(r) {
     pending_expunge: r.pending_expunge || [],
   };
   if (r.blocked_by?.length) out.expunge_blocked_by = r.blocked_by;
+  if (r.expunge_cleared_blockers) out.expunge_cleared_blockers = r.expunge_cleared_blockers;
   if (r.note) out.note = r.note;
   else if (!expunged) {
     out.note =

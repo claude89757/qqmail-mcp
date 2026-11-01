@@ -179,17 +179,16 @@ describe("modify tools", () => {
     expect(imap.folders.Junk.messages).toHaveLength(1);
   });
 
-  it("without UIDPLUS skips EXPUNGE when other deleted messages exist", async () => {
+  it("without UIDPLUS temporarily clears other deleted flags then EXPUNGEs", async () => {
     imap.caps = "IMAP4rev1";
     imap.find("INBOX", 101).flags.add("\\Deleted");
     const r = await call("move_emails", { uids: [102], destination: "junk" });
-    expect(r.source_expunged).toBe(false);
-    expect(r.expunge_method).toBe("none");
-    expect(r.pending_expunge).toContain(102);
-    expect(r.expunge_blocked_by).toContain(101);
-    expect(imap.folders.INBOX.messages.map((m) => m.uid).sort()).toEqual([101, 102]);
-    expect(imap.find("INBOX", 102).flags.has("\\Deleted")).toBe(true);
+    expect(r).toMatchObject({ moved: 1, move_method: "copy", source_expunged: true, expunge_method: "expunge", pending_expunge: [] });
+    expect(r.expunge_cleared_blockers).toBe(1);
+    expect(imap.folders.INBOX.messages.map((m) => m.uid)).toEqual([101]);
+    expect(imap.find("INBOX", 101).flags.has("\\Deleted")).toBe(true);
     expect(imap.folders.Junk.messages).toHaveLength(1);
+    expect(imap.commands.some((c) => c.includes("-FLAGS.SILENT"))).toBe(true);
   });
 
   it("deletes to Trash, then permanently from Trash", async () => {

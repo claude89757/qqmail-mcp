@@ -301,6 +301,12 @@ class FakeImapSession {
       folder().messages = folder().messages.filter((m) => !(set.includes(m.uid) && m.flags.has("\\Deleted")));
       return ok();
     }
+    if (upper === "CLOSE") {
+      const f = folder();
+      f.messages = f.messages.filter((m) => !m.flags.has("\\Deleted"));
+      s.selected = null;
+      return ok();
+    }
     if (upper === "EXPUNGE") {
       const f = folder();
       f.messages = f.messages.filter((m) => !m.flags.has("\\Deleted"));

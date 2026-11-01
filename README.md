@@ -17,7 +17,7 @@ Hosted instance used by the author: **`https://qqmail.zacks.vision/mcp`**
 | `list_attachments` | `mail:read` | Part numbers, filenames, types, approximate sizes |
 | `download_attachment` | `mail:read` | Inline base64 (images come back as image content), or a short-lived HTTPS link that streams files of any size |
 | `set_email_flags` | `mail:modify` | Read/unread, star/unstar, answered |
-| `move_emails` | `mail:modify` | Move between folders (uses `MOVE` when available; otherwise `COPY` + `\Deleted` + `UID EXPUNGE` or a safe mailbox `EXPUNGE` when no other deleted mail would be wiped). Returns `source_expunged` / `pending_expunge`. |
+| `move_emails` | `mail:modify` | Move between folders (uses `MOVE` when available; otherwise `COPY` + `\Deleted` + targeted cleanup). Without UIDPLUS, temporarily clears unrelated `\Deleted` flags, EXPUNGEs (CLOSE fallback), restores them, and verifies removal. Returns `source_expunged` / `pending_expunge` / `expunge_cleared_blockers`. |
 | `delete_emails` | `mail:modify` | Move to Trash; `permanent: true` (or deleting from Trash) expunges |
 | `save_draft` | `mail:modify` | Save or replace a draft in Drafts |
 | `send_email` | `mail:send` | Send through `smtp.qq.com:465` with cc, bcc, HTML and attachments |
@@ -135,9 +135,10 @@ src/access.js      Cloudflare Access JWT verification
 src/mcp.js         JSON-RPC / Streamable HTTP handler
 src/tools.js       tool schemas, annotations, scopes
 src/mail.js        tool implementations
-src/imap.js        IMAP client (literals, MOVE/UIDPLUS fallbacks, safe EXPUNGE without UIDPLUS, streaming fetch)
-                   Note: QQ Mail often lacks UIDPLUS; without it we only EXPUNGE when every \Deleted
-                   message in the mailbox is one we just marked (avoids wiping unrelated trash).
+src/imap.js        IMAP client (literals, MOVE/UIDPLUS fallbacks, verified EXPUNGE without UIDPLUS, streaming fetch)
+                   Note: QQ Mail often lacks UIDPLUS and may return empty DELETED searches. We verify
+                   after EXPUNGE/CLOSE; unrelated \Deleted flags are cleared only for the EXPUNGE
+                   window then restored so other trash is not wiped.
 src/imap-parse.js  response parser, BODYSTRUCTURE, modified UTF-7
 src/mime.js        header decoding, HTML→text, message builder
 src/smtp.js        SMTP client (AUTH LOGIN, dot-stuffing)
