@@ -42,6 +42,11 @@ describe("HTML-only draft regressions", () => {
       ]
     })});
   }
+  function plainMime(raw) {
+    const m = /Content-Type: text\/plain[^\r\n]*\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]*)/i.exec(raw);
+    expect(m, "generated MIME must contain a plain-text part").not.toBeNull();
+    return Buffer.from(m[1].replace(/\s/g, ""), "base64").toString("utf8");
+  }
   it.each(["", "   \r\n"])("reads HTML fallback when plain alternative is %j without marking read", async plain => {
     legacy(plain);
     const r = await call("read_email", {uid: 103, format: "text"});
@@ -50,19 +55,20 @@ describe("HTML-only draft regressions", () => {
   });
   it("creates a readable plain alternative for an HTML-only draft and sends it", async () => {
     const d = await call("save_draft", {to: ["me@qq.com"], subject: "HTML draft", html: "<p>草稿青竹</p>"});
-    const r = await call("read_email", {folder: "drafts", uid: d.uid, format: "text"});
-    expect(r.body).toContain("草稿青竹");
+    // The APPEND fake stores raw bytes but does not parse MIME into BODYSTRUCTURE.
+    // Inspect the generated MIME before and after delivery; live acceptance also reads it via QQ.
+    expect(plainMime(imap.find("Drafts", d.uid).raw)).toContain("草稿青竹");
     const sent = await call("send_draft", {uid: d.uid, save_to_sent: true});
     expect(sent.sent).toBe(true);
     expect(smtp.sent).toHaveLength(1);
-    const copy = await call("read_email", {folder: "sent", uid: 1, format: "text"});
-    expect(copy.body).toContain("草稿青竹");
+    expect(plainMime(smtp.sent[0].data)).toContain("草稿青竹");
+    expect(plainMime(imap.find("Sent Messages", 1).raw)).toContain("草稿青竹");
   });
   it("quotes the HTML original rather than an empty plain alternative", async () => {
     legacy("   ");
     await call("reply_email", {uid: 103, body: "Reply", save_to_sent: true});
-    const copy = await call("read_email", {folder: "sent", uid: 1, format: "text"});
-    expect(copy.body).toContain("HTML 正文青竹");
+    expect(plainMime(smtp.sent[0].data)).toContain("HTML 正文青竹");
+    expect(plainMime(imap.find("Sent Messages", 1).raw)).toContain("HTML 正文青竹");
   });
 });
 '''
