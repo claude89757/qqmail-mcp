@@ -81,11 +81,12 @@ export function makeMessage({ headers, parts, flags = [], internalDate = "01-Nov
 // IMAP
 
 export class FakeImapServer {
-  constructor({ user, password, folders, caps = "IMAP4rev1 MOVE UIDPLUS", emptyDeletedSearch = false }) {
+  constructor({ user, password, folders, caps = "IMAP4rev1 MOVE UIDPLUS", emptyDeletedSearch = false, noopExpunge = false }) {
     this.user = user;
     this.password = password;
     this.caps = caps;
     this.emptyDeletedSearch = emptyDeletedSearch;
+    this.noopExpunge = noopExpunge;
     this.folders = {};
     for (const [name, def] of Object.entries(folders)) {
       this.folders[name] = { flags: def.flags || [], nextUid: 1, messages: [] };
@@ -303,11 +304,12 @@ class FakeImapSession {
     }
     if (upper === "CLOSE") {
       const f = folder();
-      f.messages = f.messages.filter((m) => !m.flags.has("\\Deleted"));
+      if (!s.noopExpunge) f.messages = f.messages.filter((m) => !m.flags.has("\\Deleted"));
       s.selected = null;
       return ok();
     }
     if (upper === "EXPUNGE") {
+      if (s.noopExpunge) return ok();
       const f = folder();
       f.messages = f.messages.filter((m) => !m.flags.has("\\Deleted"));
       return ok();

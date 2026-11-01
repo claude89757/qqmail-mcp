@@ -306,13 +306,31 @@ describe("send tools", () => {
     expect(imap.commands.some((c) => /\bEXPUNGE$/.test(c))).toBe(true);
   });
 
-  it("still EXPUNGEs when DELETED search returns empty (QQ quirk)", async () => {
+    it("still EXPUNGEs when DELETED search returns empty (QQ quirk)", async () => {
     imap.caps = "IMAP4rev1";
     imap.emptyDeletedSearch = true;
     await call("save_draft", { to: ["ann@example.com"], subject: "EmptyDeletedSearch", body: "x" });
     const r = await call("send_draft", { uid: 1 });
     expect(r).toMatchObject({ sent: true, draft_removed: true, expunge_method: "expunge_empty_deleted_search", pending_expunge: [] });
     expect(imap.folders.Drafts.messages).toHaveLength(0);
+  });
+
+  it("reports pending_expunge when EXPUNGE is a no-op (QQ)", async () => {
+    imap.caps = "IMAP4rev1";
+    imap.emptyDeletedSearch = true;
+    imap.noopExpunge = true;
+    await call("save_draft", { to: ["ann@example.com"], subject: "NoopExpunge", body: "x" });
+    const r = await call("send_draft", { uid: 1 });
+    expect(r.sent).toBe(true);
+    expect(r.draft_removed).toBe(true); // soft: flagged \Deleted, hidden from default search
+    expect(r.source_expunged).toBe(false);
+    expect(r.pending_expunge).toContain(1);
+    expect(imap.folders.Drafts.messages).toHaveLength(1);
+    expect(imap.find("Drafts", 1).flags.has("\\Deleted")).toBe(true);
+    const listed = await call("search_emails", { folder: "drafts", limit: 10 });
+    expect(listed.results.map((x) => x.uid)).not.toContain(1);
+    const withDeleted = await call("search_emails", { folder: "drafts", limit: 10, include_deleted: true });
+    expect(withDeleted.results.map((x) => x.uid)).toContain(1);
   });
 
   it("surfaces SMTP authentication failures", async () => {

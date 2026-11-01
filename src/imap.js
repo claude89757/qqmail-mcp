@@ -252,13 +252,12 @@ export class ImapSession {
     return list.some((f) => String(f).toLowerCase() === "\\deleted");
   }
 
-  /** UIDs from `list` that still exist in the selected mailbox. */
+  /** UIDs from `list` that still exist in the selected mailbox (FETCH, not SEARCH — QQ hides \Deleted from SEARCH). */
   async uidsStillPresent(list) {
     if (!list.length) return [];
     try {
-      const found = await this.uidSearch(`UID ${uidSet(list)}`);
-      const want = new Set(list);
-      return found.filter((u) => want.has(u));
+      const rows = await this.uidFetch(list, "UID FLAGS");
+      return list.filter((u) => rows.has(u));
     } catch {
       return list.slice();
     }

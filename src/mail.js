@@ -79,7 +79,13 @@ export function searchCriteria(args) {
 
 function flagsOf(attrs) {
   const f = (Array.isArray(attrs.FLAGS) ? attrs.FLAGS : []).map((x) => String(x).toLowerCase());
-  return { seen: f.includes("\\seen"), flagged: f.includes("\\flagged"), answered: f.includes("\\answered"), draft: f.includes("\\draft") };
+  return {
+    seen: f.includes("\\seen"),
+    flagged: f.includes("\\flagged"),
+    answered: f.includes("\\answered"),
+    draft: f.includes("\\draft"),
+    deleted: f.includes("\\deleted"),
+  };
 }
 
 function headerMap(attrs, section = "HEADER") {
@@ -266,9 +272,21 @@ export async function searchEmails(ctx, args) {
   const needle = clean(args.query || args.subject || args.from || args.to || "", 200);
   return withImap(ctx.env, ctx.connect, async (s) => {
     const box = await s.open(args.folder);
+
+  const includeDeleted = !!args.include_deleted;
+  const dropDeleted = async (uids) => {
+    if (includeDeleted || !uids.length) return uids;
+    const rows = await s.uidFetch(uids, "UID FLAGS");
+    return uids.filter((u) => {
+      const row = rows.get(u);
+      if (!row) return false;
+      return !flagsOf(row).deleted;
+    });
+  };
+
     let ids;
     try {
-      ids = await s.uidSearch(...criteria);
+      ids = await dropDeleted(await s.uidSearch(...criteria));
     } catch (e) {
       // QQ Mail often rejects CHARSET UTF-8 / sync literals. Fall back to a recent-window client filter.
       if (!needle) throw e;
@@ -276,18 +294,19 @@ export async function searchEmails(ctx, args) {
       const window = recent.slice(-Math.min(recent.length, Math.max(limit * 20, 80)));
       if (!window.length) return { folder: box.name, total: 0, count: 0, offset, results: [], note: "Chinese search fell back to client filter; no messages." };
       const rows = await s.uidFetch(window, SUMMARY_ITEMS);
-      const matched = window.filter((u) => {
+            const matched = window.filter((u) => {
         if (!rows.has(u)) return false;
         const row = summary(u, rows.get(u));
         const hay = `${row.subject}\n${row.from}\n${row.to}`.toLowerCase();
         return hay.includes(needle.toLowerCase());
       });
-      const end = Math.max(0, matched.length - offset);
-      const page = matched.slice(Math.max(0, end - limit), end).reverse();
+      const matchedLive = await dropDeleted(matched);
+      const end = Math.max(0, matchedLive.length - offset);
+      const page = matchedLive.slice(Math.max(0, end - limit), end).reverse();
       const results = page.filter((u) => rows.has(u)).map((u) => summary(u, rows.get(u)));
       return {
         folder: box.name,
-        total: matched.length,
+        total: matchedLive.length,
         count: results.length,
         offset,
         has_more: end - limit > 0,
@@ -654,10 +673,26 @@ export async function sendDraft(ctx, args) {
       const outgoing = binaryToBytes(removeHeader(binary, "Bcc"));
       const r = await deliver(ctx, s, { message: outgoing, envelope: envelopeOf(rcpt), saveToSent: saveSentDefault(ctx.env, args.save_to_sent) });
       let cleanup = { expunged: true, expunge_method: "none", pending_expunge: [] };
+      let draft_removed = true;
       if (!args.keep_draft) {
         await s.open("drafts", { write: true });
         await s.uidStore([uid], "+", ["\\Deleted"]);
         cleanup = await s.uidExpunge([uid]);
+        draft_removed = !!cleanup.expunged;
+        if (!draft_removed) {
+          const rows = await s.uidFetch([uid], "UID FLAGS");
+          if (!rows.has(uid)) draft_removed = true;
+          else if (flagsOf(rows.get(uid)).deleted) {
+            draft_removed = true;
+            if (!cleanup.note) {
+              cleanup = {
+                ...cleanup,
+                note:
+                  "Draft flagged \\Deleted but not expunged (QQ Mail often cannot EXPUNGE without UIDPLUS). Hidden from default search listings.",
+              };
+            }
+          }
+        }
       }
       return {
         ...r,
@@ -666,7 +701,7 @@ export async function sendDraft(ctx, args) {
         to: rcpt.to.map(formatAddressForDisplay),
         cc: rcpt.cc.map(formatAddressForDisplay),
         bcc_count: rcpt.bcc.length,
-        draft_removed: !!cleanup.expunged,
+        draft_removed,
         ...cleanupFields(cleanup),
       };
     },
