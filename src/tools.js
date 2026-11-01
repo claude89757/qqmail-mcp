@@ -188,7 +188,13 @@ export const TOOLS = [
     scope: SCOPES.send,
     handler: mail.replyEmail,
     annotations: SEND,
-    description: "Reply to a message (threaded with In-Reply-To/References, original quoted). reply_all also includes the original To/Cc recipients. Marks the original as answered." + SEND_NOTE,
+    description:
+      "Reply to a message (threaded with In-Reply-To/References, original quoted). " +
+      "reply_all also includes the original To/Cc recipients (self excluded). " +
+      "For mail you sent yourself, recipients are inferred from the original To (excluding you); " +
+      "if that leaves nobody (only-self), pass to explicitly or omit it to reply to your own address. " +
+      "Marks the original as answered." +
+      SEND_NOTE,
     inputSchema: obj(
       {
         folder,
@@ -196,6 +202,7 @@ export const TOOLS = [
         body: { type: "string", description: "Your reply (plain text)." },
         html: { type: "string" },
         reply_all: { type: "boolean", default: false },
+        to: addresses("Override To (required for some self-sent / only-self threads; wins over inference)"),
         cc: addresses("Additional Cc"),
         bcc: addresses("Bcc"),
         quote_original: { type: "boolean", default: true },

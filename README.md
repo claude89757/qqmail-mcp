@@ -17,11 +17,11 @@ Hosted instance used by the author: **`https://qqmail.zacks.vision/mcp`**
 | `list_attachments` | `mail:read` | Part numbers, filenames, types, approximate sizes |
 | `download_attachment` | `mail:read` | Inline base64 (images come back as image content), or a short-lived HTTPS link that streams files of any size |
 | `set_email_flags` | `mail:modify` | Read/unread, star/unstar, answered |
-| `move_emails` | `mail:modify` | Move between folders (uses `MOVE` when available, otherwise `COPY` plus `UID EXPUNGE`) |
+| `move_emails` | `mail:modify` | Move between folders (uses `MOVE` when available; otherwise `COPY` + `\Deleted` + `UID EXPUNGE` or a safe mailbox `EXPUNGE` when no other deleted mail would be wiped). Returns `source_expunged` / `pending_expunge`. |
 | `delete_emails` | `mail:modify` | Move to Trash; `permanent: true` (or deleting from Trash) expunges |
 | `save_draft` | `mail:modify` | Save or replace a draft in Drafts |
 | `send_email` | `mail:send` | Send through `smtp.qq.com:465` with cc, bcc, HTML and attachments |
-| `reply_email` | `mail:send` | Threaded reply (`In-Reply-To`/`References`), quotes the original, optional reply-all; marks the original as answered |
+| `reply_email` | `mail:send` | Threaded reply (`In-Reply-To`/`References`), quotes the original, optional reply-all; optional `to` override (self-sent / only-self defaults to your address); marks the original as answered |
 | `forward_email` | `mail:send` | Forward with a note; original attachments are passed through |
 | `send_draft` | `mail:send` | Send a draft from Drafts (Bcc stripped from the content) and remove it |
 
@@ -90,7 +90,7 @@ Values can also be set as plain-text variables in the dashboard. `wrangler.jsonc
 1. Before deploying v2, set `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` (and preferably `ACCESS_ALLOWED_EMAILS`). Without them, new authorizations return 503. Existing tokens and refresh tokens are not affected.
 2. `npm run deploy` deploys to the same Worker name (`qqmail-mcp`), custom domain, D1 binding and secrets.
 3. Reconnect ChatGPT, Grok Bot and Cursor to get the new scopes.
-4. Check `GET /health`. It should report `"version":"2.0.1"` and `"access_jwt_verification":true`.
+4. Check `GET /health`. It should report `"version":"2.0.2"` and `"access_jwt_verification":true`.
 
 ### Configuration reference
 
@@ -135,7 +135,9 @@ src/access.js      Cloudflare Access JWT verification
 src/mcp.js         JSON-RPC / Streamable HTTP handler
 src/tools.js       tool schemas, annotations, scopes
 src/mail.js        tool implementations
-src/imap.js        IMAP client (literals, MOVE/UIDPLUS fallbacks, streaming fetch)
+src/imap.js        IMAP client (literals, MOVE/UIDPLUS fallbacks, safe EXPUNGE without UIDPLUS, streaming fetch)
+                   Note: QQ Mail often lacks UIDPLUS; without it we only EXPUNGE when every \Deleted
+                   message in the mailbox is one we just marked (avoids wiping unrelated trash).
 src/imap-parse.js  response parser, BODYSTRUCTURE, modified UTF-7
 src/mime.js        header decoding, HTML→text, message builder
 src/smtp.js        SMTP client (AUTH LOGIN, dot-stuffing)

@@ -233,23 +233,44 @@ export class ImapSession {
     await this.command(`UID STORE ${uidSet(uids)} ${op}FLAGS.SILENT (${flags.join(" ")})`);
   }
 
-  /** Moves messages; falls back to COPY + \Deleted + UID EXPUNGE when MOVE is unavailable. */
+  /** Moves messages; falls back to COPY + \Deleted + targeted expunge when MOVE is unavailable. */
   async uidMove(uids, destRaw) {
     if (this.has("MOVE")) {
       await this.command(`UID MOVE ${uidSet(uids)} `, imapQuote(destRaw));
-      return { method: "move", expunged: true };
+      return { method: "move", expunged: true, expunge_method: "move", pending_expunge: [] };
     }
     await this.command(`UID COPY ${uidSet(uids)} `, imapQuote(destRaw));
     await this.uidStore(uids, "+", ["\\Deleted"]);
-    const expunged = await this.uidExpunge(uids);
-    return { method: "copy", expunged };
+    const cleanup = await this.uidExpunge(uids);
+    return { method: "copy", ...cleanup };
   }
 
-  /** Expunges only the given UIDs; without UIDPLUS it leaves them flagged \Deleted rather than expunging other messages. */
+  /**
+   * Removes the given UIDs that are flagged \Deleted.
+   * Prefers UID EXPUNGE (UIDPLUS). Without UIDPLUS, runs a mailbox EXPUNGE only when every
+   * currently \Deleted message is one of the UIDs we just marked — never wipes unrelated trash.
+   * Returns { expunged, expunge_method: "uid_expunge"|"expunge"|"none", pending_expunge, blocked_by? }.
+   */
   async uidExpunge(uids) {
-    if (!this.has("UIDPLUS")) return false;
-    await this.command(`UID EXPUNGE ${uidSet(uids)}`);
-    return true;
+    const list = [...new Set((uids || []).map(Number).filter((n) => n > 0))];
+    if (!list.length) return { expunged: true, expunge_method: "none", pending_expunge: [] };
+    if (this.has("UIDPLUS")) {
+      await this.command(`UID EXPUNGE ${uidSet(list)}`);
+      return { expunged: true, expunge_method: "uid_expunge", pending_expunge: [] };
+    }
+    const deleted = await this.uidSearch("DELETED");
+    const want = new Set(list);
+    const blockedBy = deleted.filter((u) => !want.has(u));
+    if (blockedBy.length) {
+      return { expunged: false, expunge_method: "none", pending_expunge: list.filter((u) => deleted.includes(u) || want.has(u)), blocked_by: blockedBy };
+    }
+    // Safe: every \Deleted message in this mailbox is one we intend to remove.
+    if (deleted.length) {
+      await this.command("EXPUNGE");
+      return { expunged: true, expunge_method: "expunge", pending_expunge: [] };
+    }
+    // STORE may have failed silently or UIDs were already gone.
+    return { expunged: false, expunge_method: "none", pending_expunge: list };
   }
 
   /** APPENDs a message; returns the new UID when the server reports APPENDUID (UIDPLUS). */

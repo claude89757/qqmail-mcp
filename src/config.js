@@ -1,5 +1,5 @@
 export const NAME = "qqmail-mcp";
-export const VERSION = "2.0.1";
+export const VERSION = "2.0.2";
 
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 export const DEFAULT_PROTOCOL_VERSION = "2025-06-18";

@@ -165,8 +165,31 @@ describe("modify tools", () => {
     imap.caps = "IMAP4rev1 UIDPLUS";
     const r = await call("move_emails", { uids: [102], destination: "junk" });
     expect(r.moved).toBe(1);
+    expect(r).toMatchObject({ move_method: "copy", source_expunged: true, expunge_method: "uid_expunge" });
     expect(imap.commands.some((c) => c.includes("UID COPY"))).toBe(true);
     expect(imap.folders.INBOX.messages.map((m) => m.uid)).toEqual([101]);
+  });
+
+  it("without UIDPLUS uses safe mailbox EXPUNGE when only our messages are deleted", async () => {
+    imap.caps = "IMAP4rev1";
+    const r = await call("move_emails", { uids: [102], destination: "junk" });
+    expect(r).toMatchObject({ moved: 1, move_method: "copy", source_expunged: true, expunge_method: "expunge", pending_expunge: [] });
+    expect(imap.commands.some((c) => /\bEXPUNGE$/.test(c))).toBe(true);
+    expect(imap.folders.INBOX.messages.map((m) => m.uid)).toEqual([101]);
+    expect(imap.folders.Junk.messages).toHaveLength(1);
+  });
+
+  it("without UIDPLUS skips EXPUNGE when other deleted messages exist", async () => {
+    imap.caps = "IMAP4rev1";
+    imap.find("INBOX", 101).flags.add("\\Deleted");
+    const r = await call("move_emails", { uids: [102], destination: "junk" });
+    expect(r.source_expunged).toBe(false);
+    expect(r.expunge_method).toBe("none");
+    expect(r.pending_expunge).toContain(102);
+    expect(r.expunge_blocked_by).toContain(101);
+    expect(imap.folders.INBOX.messages.map((m) => m.uid).sort()).toEqual([101, 102]);
+    expect(imap.find("INBOX", 102).flags.has("\\Deleted")).toBe(true);
+    expect(imap.folders.Junk.messages).toHaveLength(1);
   });
 
   it("deletes to Trash, then permanently from Trash", async () => {
@@ -229,6 +252,34 @@ describe("send tools", () => {
     expect(imap.find("INBOX", 101).flags.has("\\Answered")).toBe(true);
   });
 
+  it("replies to self-sent only-self mail by defaulting to own address", async () => {
+    const selfMsg = {
+      uid: 201,
+      ...makeMessage({
+        headers: { From: "我 <me@qq.com>", To: "me@qq.com", Subject: "self note", Date: "Sun, 01 Nov 2026 12:00:00 +0800", "Message-ID": "<self201@qq.com>" },
+        parts: [{ type: "text/plain", params: { CHARSET: "UTF-8" }, encoding: "7bit", content: "only me" }],
+      }),
+    };
+    imap.add("Sent Messages", selfMsg, 201);
+    const r = await call("reply_email", { folder: "sent", uid: 201, body: "looping back", quote_original: false });
+    expect(r.to).toEqual(["我 <me@qq.com>"]);
+    expect(smtp.sent[0].rcpt).toEqual(["me@qq.com"]);
+  });
+
+  it("lets reply_email override recipients with explicit to", async () => {
+    const selfMsg = {
+      uid: 202,
+      ...makeMessage({
+        headers: { From: "我 <me@qq.com>", To: "me@qq.com", Subject: "self note 2", Date: "Sun, 01 Nov 2026 12:05:00 +0800", "Message-ID": "<self202@qq.com>" },
+        parts: [{ type: "text/plain", params: { CHARSET: "UTF-8" }, encoding: "7bit", content: "only me" }],
+      }),
+    };
+    imap.add("Sent Messages", selfMsg, 202);
+    const r = await call("reply_email", { folder: "sent", uid: 202, body: "redirect", to: ["other@example.com"], quote_original: false });
+    expect(r.to).toEqual(["other@example.com"]);
+    expect(smtp.sent[0].rcpt).toEqual(["other@example.com"]);
+  });
+
   it("forwards with the original attachment passed through", async () => {
     const r = await call("forward_email", { uid: 101, to: ["boss@example.com"], body: "FYI" });
     expect(r).toMatchObject({ attachments_forwarded: 1, subject: "Fwd: 会议通知" });
@@ -241,10 +292,19 @@ describe("send tools", () => {
   it("sends a draft, strips Bcc from the content and removes the draft", async () => {
     await call("save_draft", { to: ["ann@example.com"], bcc: ["boss@example.com"], subject: "Plan", body: "draft body" });
     const r = await call("send_draft", { uid: 1 });
-    expect(r).toMatchObject({ sent: true, draft_removed: true, bcc_count: 1, subject: "Plan" });
+    expect(r).toMatchObject({ sent: true, draft_removed: true, bcc_count: 1, subject: "Plan", source_expunged: true });
     expect(smtp.sent[0].rcpt).toEqual(["ann@example.com", "boss@example.com"]);
     expect(smtp.sent[0].data).not.toMatch(/^Bcc:/im);
     expect(imap.folders.Drafts.messages).toHaveLength(0);
+  });
+
+  it("removes a draft via safe EXPUNGE when UIDPLUS is absent", async () => {
+    imap.caps = "IMAP4rev1";
+    await call("save_draft", { to: ["ann@example.com"], subject: "NoUidplus", body: "x" });
+    const r = await call("send_draft", { uid: 1 });
+    expect(r).toMatchObject({ sent: true, draft_removed: true, expunge_method: "expunge", pending_expunge: [] });
+    expect(imap.folders.Drafts.messages).toHaveLength(0);
+    expect(imap.commands.some((c) => /\bEXPUNGE$/.test(c))).toBe(true);
   });
 
   it("surfaces SMTP authentication failures", async () => {

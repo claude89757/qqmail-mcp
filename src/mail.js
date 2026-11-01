@@ -407,6 +407,25 @@ export async function setEmailFlags(ctx, args) {
   });
 }
 
+
+function cleanupFields(r) {
+  const expunged = !!r.expunged;
+  const out = {
+    source_expunged: expunged,
+    expunge_method: r.expunge_method || (expunged ? "unknown" : "none"),
+    pending_expunge: r.pending_expunge || [],
+  };
+  if (r.blocked_by?.length) out.expunge_blocked_by = r.blocked_by;
+  if (!expunged) {
+    out.note =
+      "Source message(s) were flagged \\Deleted but not expunged. " +
+      (r.blocked_by?.length
+        ? "Mailbox already had other \\Deleted messages; a full EXPUNGE would remove those too, so cleanup was skipped (QQ Mail often lacks UIDPLUS)."
+        : "Server did not support a targeted expunge (no UIDPLUS) and no safe mailbox EXPUNGE was possible.");
+  }
+  return out;
+}
+
 export async function moveEmails(ctx, args) {
   const uids = uidsOf(args);
   if (!clean(args.destination, 300)) throw new MailError("destination is required");
@@ -417,7 +436,14 @@ export async function moveEmails(ctx, args) {
     const existing = await s.uidSearch(`UID ${uidSet(uids)}`);
     if (!existing.length) throw new MailError("None of the given UIDs exist in this folder");
     const r = await s.uidMove(existing, dest);
-    return { folder: box.name, destination: (await s.listFolders()).find((f) => f.raw === dest)?.name || args.destination, moved: existing.length, missing: uids.filter((u) => !existing.includes(u)), ...(r.expunged ? {} : { note: "Copied and flagged as deleted in the source folder; the server does not support removing them individually." }) };
+    return {
+      folder: box.name,
+      destination: (await s.listFolders()).find((f) => f.raw === dest)?.name || args.destination,
+      moved: existing.length,
+      missing: uids.filter((u) => !existing.includes(u)),
+      move_method: r.method,
+      ...cleanupFields(r),
+    };
   });
 }
 
@@ -431,11 +457,23 @@ export async function deleteEmails(ctx, args) {
     const missing = uids.filter((u) => !existing.includes(u));
     if (!args.permanent && trash && trash !== box.raw) {
       const r = await s.uidMove(existing, trash);
-      return { folder: box.name, moved_to_trash: existing.length, missing, ...(r.expunged ? {} : { note: "Copied to Trash and flagged as deleted here." }) };
+      return {
+        folder: box.name,
+        moved_to_trash: existing.length,
+        missing,
+        move_method: r.method,
+        ...cleanupFields(r),
+      };
     }
     await s.uidStore(existing, "+", ["\\Deleted"]);
-    const expunged = await s.uidExpunge(existing);
-    return { folder: box.name, permanently_deleted: expunged ? existing.length : 0, flagged_deleted: expunged ? 0 : existing.length, missing };
+    const cleanup = await s.uidExpunge(existing);
+    return {
+      folder: box.name,
+      permanently_deleted: cleanup.expunged ? existing.length : 0,
+      flagged_deleted: cleanup.expunged ? 0 : existing.length,
+      missing,
+      ...cleanupFields(cleanup),
+    };
   });
 }
 
@@ -450,14 +488,23 @@ export async function saveDraft(ctx, args) {
     const box = await s.open("drafts", { write: true });
     if (!uid) uid = (await s.uidSearch(`HEADER Message-ID ${imapQuote(messageId)}`)).pop() ?? null;
     let replaced = false;
+    let replace_cleanup = null;
     if (args.replace_draft_uid !== undefined) {
       const old = uidOf(args.replace_draft_uid);
       if (old !== uid) {
         await s.uidStore([old], "+", ["\\Deleted"]);
-        replaced = await s.uidExpunge([old]);
+        replace_cleanup = await s.uidExpunge([old]);
+        replaced = !!replace_cleanup.expunged;
       }
     }
-    return { saved: true, folder: box.name, uid, message_id: messageId, replaced_previous: replaced };
+    return {
+      saved: true,
+      folder: box.name,
+      uid,
+      message_id: messageId,
+      replaced_previous: replaced,
+      ...(replace_cleanup ? cleanupFields(replace_cleanup) : {}),
+    };
   });
 }
 
@@ -482,9 +529,10 @@ function replyRecipients(env, h, replyAll) {
   const sentByMe = parseAddressList(h.from || "").some((a) => a.address.toLowerCase() === me);
   const seen = new Set([me]);
   const take = (list) => list.filter((a) => isValidAddress(a.address) && !seen.has(a.address.toLowerCase()) && seen.add(a.address.toLowerCase()));
+  // Self-sent mail: reply to original To (excluding self). Only-self leaves `to` empty for override/default.
   const to = take(sentByMe ? origTo : from);
   const cc = replyAll ? take(sentByMe ? origCc : [...origTo, ...origCc]) : [];
-  return { to, cc };
+  return { to, cc, sentByMe };
 }
 
 export async function replyEmail(ctx, args) {
@@ -499,7 +547,11 @@ export async function replyEmail(ctx, args) {
       const { headers: h, parts } = await loadMessage(s, uid);
       const base = replyRecipients(ctx.env, h, !!args.reply_all);
       const extra = recipientsOf(args, { allowEmpty: true });
-      const to = base.to.length ? base.to : extra.to;
+      // Explicit `to` always wins; else inferred; for only-self mail default to own address.
+      let to = extra.to.length ? extra.to : base.to;
+      if (!to.length && base.sentByMe && ctx.env.QQ_EMAIL) {
+        to = [{ name: clean(ctx.env.QQ_DISPLAY_NAME || "", 100), address: ctx.env.QQ_EMAIL }];
+      }
       const cc = [...base.cc, ...extra.cc.filter((a) => !base.cc.some((b) => b.address.toLowerCase() === a.address.toLowerCase()))];
       const bcc = extra.bcc;
       if (!to.length) throw new MailError("Could not determine who to reply to; pass to explicitly");
@@ -599,13 +651,22 @@ export async function sendDraft(ctx, args) {
       const rcpt = recipientsOf({ to: h.to || [], cc: h.cc || [], bcc: h.bcc || [] });
       const outgoing = binaryToBytes(removeHeader(binary, "Bcc"));
       const r = await deliver(ctx, s, { message: outgoing, envelope: envelopeOf(rcpt), saveToSent: saveSentDefault(ctx.env, args.save_to_sent) });
-      let removed = false;
+      let cleanup = { expunged: true, expunge_method: "none", pending_expunge: [] };
       if (!args.keep_draft) {
         await s.open("drafts", { write: true });
         await s.uidStore([uid], "+", ["\\Deleted"]);
-        removed = await s.uidExpunge([uid]);
+        cleanup = await s.uidExpunge([uid]);
       }
-      return { ...r, draft_uid: uid, subject: h.subject || "", to: rcpt.to.map(formatAddressForDisplay), cc: rcpt.cc.map(formatAddressForDisplay), bcc_count: rcpt.bcc.length, draft_removed: removed };
+      return {
+        ...r,
+        draft_uid: uid,
+        subject: h.subject || "",
+        to: rcpt.to.map(formatAddressForDisplay),
+        cc: rcpt.cc.map(formatAddressForDisplay),
+        bcc_count: rcpt.bcc.length,
+        draft_removed: !!cleanup.expunged,
+        ...cleanupFields(cleanup),
+      };
     },
     { timeoutMs: LIMITS.sendTimeoutMs }
   );

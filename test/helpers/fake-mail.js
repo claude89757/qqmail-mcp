@@ -223,6 +223,7 @@ class FakeImapSession {
       let msgs = folder().messages;
       if (/\bUNSEEN\b/.test(upper)) msgs = msgs.filter((m) => !m.flags.has("\\Seen"));
       if (/\bFLAGGED\b/.test(upper)) msgs = msgs.filter((m) => m.flags.has("\\Flagged"));
+      if (/\bDELETED\b/.test(upper)) msgs = msgs.filter((m) => m.flags.has("\\Deleted"));
       const uidm = /\bUID ([\d,:]+)/.exec(cmdLine.slice(10));
       if (uidm) msgs = msgs.filter((m) => parseSet(uidm[1]).includes(m.uid));
       const hm = /HEADER Message-ID ("(?:[^"\\]|\\.)*")/i.exec(cmdLine);
@@ -297,6 +298,11 @@ class FakeImapSession {
     if (upper.startsWith("UID EXPUNGE ")) {
       const set = parseSet(cmdLine.split(" ")[2]);
       folder().messages = folder().messages.filter((m) => !(set.includes(m.uid) && m.flags.has("\\Deleted")));
+      return ok();
+    }
+    if (upper === "EXPUNGE") {
+      const f = folder();
+      f.messages = f.messages.filter((m) => !m.flags.has("\\Deleted"));
       return ok();
     }
     this.send(`${tag} BAD unknown command\r\n`);
