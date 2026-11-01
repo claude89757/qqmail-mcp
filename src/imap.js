@@ -237,7 +237,9 @@ export class ImapSession {
   async uidMove(uids, destRaw) {
     if (this.has("MOVE")) {
       await this.command(`UID MOVE ${uidSet(uids)} `, imapQuote(destRaw));
-      return { method: "move", expunged: true, expunge_method: "move", pending_expunge: [] };
+      const left = await this.uidsStillPresent(uids);
+      if (!left.length) return { method: "move", expunged: true, expunge_method: "move", pending_expunge: [] };
+      // Advertised MOVE but source UIDs remain — fall through to COPY + EXPUNGE.
     }
     await this.command(`UID COPY ${uidSet(uids)} `, imapQuote(destRaw));
     await this.uidStore(uids, "+", ["\\Deleted"]);
@@ -259,23 +261,21 @@ export class ImapSession {
    */
   async uidsStillPresent(list) {
     if (!list.length) return [];
-    const want = new Set(list);
-    let left = [];
+    // UID SEARCH UID is the most reliable probe on QQ Mail (FETCH/ALL may hide \Deleted).
+    try {
+      const found = await this.uidSearch(`UID ${uidSet(list)}`);
+      if (found.length) return list.filter((u) => found.includes(u));
+    } catch {
+      /* fall through */
+    }
     try {
       const rows = await this.uidFetch(list, "UID FLAGS");
-      left = list.filter((u) => rows.has(u));
+      const fromFetch = list.filter((u) => rows.has(u));
+      if (fromFetch.length) return fromFetch;
     } catch {
-      left = list.slice();
+      return list.slice();
     }
-    if (left.length === list.length) return left;
-    try {
-      const all = await this.uidSearch("ALL");
-      const fromAll = all.filter((u) => want.has(u));
-      const set = new Set([...left, ...fromAll]);
-      return list.filter((u) => set.has(u));
-    } catch {
-      return left.length ? left : list.slice();
-    }
+    return [];
   }
 
   /**
@@ -315,12 +315,15 @@ export class ImapSession {
     }
     const blockers = Array.isArray(deleted) ? deleted.filter((u) => !want.has(u)) : [];
     const emptyDeletedSearch = Array.isArray(deleted) && !deleted.length;
+    // QQ may hide \Deleted from SEARCH DELETED and FETCH. Track whether FETCH saw our UIDs.
+    const qqHidingDeleted = emptyDeletedSearch && list.some((u) => !flagRows.has(u));
     let method = emptyDeletedSearch ? "expunge_empty_deleted_search" : "expunge";
     let note = emptyDeletedSearch
       ? "Server returned no DELETED hits after STORE (common on QQ Mail); issued mailbox EXPUNGE with verification."
       : undefined;
 
     const selected = this.selected;
+    const existsBefore = selected?.exists ?? null;
     let restored = true;
     if (blockers.length) {
       await this.uidStore(blockers, "-", ["\\Deleted"]);
@@ -338,7 +341,6 @@ export class ImapSession {
         this.selected = null;
         await this.open(selected.raw, { write: true });
         if (blockers.length) {
-          // Re-clear blockers after reselection; CLOSE may have skipped them if flags were off.
           await this.uidStore(blockers, "-", ["\\Deleted"]).catch(() => {});
           await this.command("EXPUNGE").catch(() => {});
         }
@@ -354,6 +356,20 @@ export class ImapSession {
           note:
             "Source message(s) remain after EXPUNGE/CLOSE. QQ Mail often lacks UIDPLUS; cleanup was verified and did not remove them.",
         };
+      }
+      if (qqHidingDeleted) {
+        const existsAfter = this.selected?.exists ?? null;
+        const dropped =
+          existsBefore != null && existsAfter != null && existsAfter <= existsBefore - list.length;
+        if (!dropped) {
+          return {
+            expunged: false,
+            expunge_method: "none",
+            pending_expunge: list,
+            note:
+              "QQ Mail hid \\Deleted from SEARCH/FETCH so EXPUNGE could not be verified (EXISTS unchanged). Messages left flagged and hidden from default search.",
+          };
+        }
       }
       return {
         expunged: true,

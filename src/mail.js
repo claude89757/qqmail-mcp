@@ -676,44 +676,55 @@ export async function sendDraft(ctx, args) {
       let cleanup = { expunged: true, expunge_method: "none", pending_expunge: [] };
       let draft_removed = true;
       if (!args.keep_draft) {
+        // Force re-SELECT: APPEND to Sent can leave the session stale on QQ Mail.
+        s.selected = null;
         await s.open("drafts", { write: true });
-        let moved = null;
-        try {
+        const existing = await s.uidSearch(`UID ${uid}`);
+        if (!existing.length) {
+          cleanup = { expunged: true, expunge_method: "already_gone", pending_expunge: [] };
+          draft_removed = true;
+        } else {
           const trash = await s.resolveFolder("trash");
-          if (trash) moved = await s.uidMove([uid], trash);
-        } catch {
-          moved = null;
-        }
-        if (moved) cleanup = moved;
-        else {
-          await s.uidStore([uid], "+", ["\\Deleted"]);
-          cleanup = await s.uidExpunge([uid]);
-        }
+          let moveErr = null;
+          try {
+            cleanup = await s.uidMove(existing, trash);
+          } catch (e) {
+            moveErr = e instanceof Error ? e.message : String(e);
+            try {
+              await s.command(`UID COPY ${uidSet(existing)} `, imapQuote(trash));
+              await s.uidStore(existing, "+", ["\\Deleted"]);
+              cleanup = { method: "copy_retry", ...(await s.uidExpunge(existing)) };
+            } catch (e2) {
+              await s.uidStore(existing, "+", ["\\Deleted"]);
+              cleanup = { method: "store_only", ...(await s.uidExpunge(existing)) };
+              cleanup.note = `Trash MOVE/COPY failed (${moveErr}); fell back to STORE. ${e2 instanceof Error ? e2.message : e2}`;
+            }
+            if (moveErr && !cleanup.note) cleanup.move_error = moveErr;
+          }
 
-        // Hard gate: re-SELECT Drafts and confirm UID is gone (QQ can lie after EXPUNGE).
-        await s.open("drafts", { write: true });
-        let left = await s.uidsStillPresent([uid]);
-        if (left.length) {
-          await s.uidStore(left, "+", ["\\Deleted"]);
-          const again = await s.uidExpunge(left);
-          left = await s.uidsStillPresent(left);
-          if (!left.length) {
-            cleanup = { ...cleanup, ...again, expunged: true };
-            draft_removed = true;
-          } else {
-            draft_removed = true; // soft-hide via \Deleted + search filter
+          // Authoritative gate: UID SEARCH UID must be empty.
+          s.selected = null;
+          await s.open("drafts", { write: true });
+          let left = await s.uidSearch(`UID ${uidSet(existing)}`);
+          if (left.length) {
+            await s.uidStore(left, "+", ["\\Deleted"]);
+            draft_removed = true; // soft-hide via search filter
             cleanup = {
+              ...cleanup,
               expunged: false,
               expunge_method: "none",
               pending_expunge: left,
               note:
+                cleanup.note ||
                 "Draft still present after Trash move/EXPUNGE; flagged \\Deleted and hidden from default search (QQ Mail lacks reliable EXPUNGE without UIDPLUS).",
             };
+          } else {
+            draft_removed = true;
+            cleanup = { ...cleanup, expunged: true, pending_expunge: [] };
           }
-        } else {
-          draft_removed = true;
         }
       }
+
       return {
         ...r,
         draft_uid: uid,
