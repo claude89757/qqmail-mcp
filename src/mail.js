@@ -434,12 +434,13 @@ function cleanupFields(r) {
     expunge_method: r.expunge_method || (expunged ? "unknown" : "none"),
     pending_expunge: r.pending_expunge || [],
   };
+  if (r.method) out.move_method = r.method;
   if (r.blocked_by?.length) out.expunge_blocked_by = r.blocked_by;
   if (r.expunge_cleared_blockers) out.expunge_cleared_blockers = r.expunge_cleared_blockers;
   if (r.note) out.note = r.note;
   else if (!expunged) {
     out.note =
-      "Source message(s) were flagged \Deleted but not expunged. " +
+      "Source message(s) were flagged \\Deleted but not expunged. " +
       (r.blocked_by?.length
         ? "Mailbox already had other \Deleted messages; a full EXPUNGE would remove those too, so cleanup was skipped (QQ Mail often lacks UIDPLUS)."
         : "Server did not support a targeted expunge (no UIDPLUS) and no safe mailbox EXPUNGE was possible.");
@@ -676,7 +677,6 @@ export async function sendDraft(ctx, args) {
       let draft_removed = true;
       if (!args.keep_draft) {
         await s.open("drafts", { write: true });
-        // Prefer COPY/MOVE to Trash then verified source cleanup (QQ Drafts EXPUNGE is flaky).
         let moved = null;
         try {
           const trash = await s.resolveFolder("trash");
@@ -684,38 +684,34 @@ export async function sendDraft(ctx, args) {
         } catch {
           moved = null;
         }
-        if (moved) {
-          cleanup = moved;
-        } else {
+        if (moved) cleanup = moved;
+        else {
           await s.uidStore([uid], "+", ["\\Deleted"]);
           cleanup = await s.uidExpunge([uid]);
         }
-        draft_removed = !!cleanup.expunged;
-        if (!draft_removed) {
-          const rows = await s.uidFetch([uid], "UID FLAGS");
-          if (!rows.has(uid)) draft_removed = true;
-          else if (flagsOf(rows.get(uid)).deleted) {
+
+        // Hard gate: re-SELECT Drafts and confirm UID is gone (QQ can lie after EXPUNGE).
+        await s.open("drafts", { write: true });
+        let left = await s.uidsStillPresent([uid]);
+        if (left.length) {
+          await s.uidStore(left, "+", ["\\Deleted"]);
+          const again = await s.uidExpunge(left);
+          left = await s.uidsStillPresent(left);
+          if (!left.length) {
+            cleanup = { ...cleanup, ...again, expunged: true };
             draft_removed = true;
-            if (!cleanup.note) {
-              cleanup = {
-                ...cleanup,
-                note:
-                  "Draft flagged \Deleted but not expunged (QQ Mail often cannot EXPUNGE without UIDPLUS). Hidden from default search listings.",
-              };
-            }
           } else {
-            // Last resort: mark deleted so listings hide it.
-            await s.uidStore([uid], "+", ["\\Deleted"]).catch(() => {});
-            const rows2 = await s.uidFetch([uid], "UID FLAGS");
-            if (rows2.has(uid) && flagsOf(rows2.get(uid)).deleted) {
-              draft_removed = true;
-              cleanup = {
-                ...cleanup,
-                pending_expunge: [uid],
-                note: "Draft could not be expunged; flagged \Deleted and hidden from default search.",
-              };
-            }
+            draft_removed = true; // soft-hide via \Deleted + search filter
+            cleanup = {
+              expunged: false,
+              expunge_method: "none",
+              pending_expunge: left,
+              note:
+                "Draft still present after Trash move/EXPUNGE; flagged \\Deleted and hidden from default search (QQ Mail lacks reliable EXPUNGE without UIDPLUS).",
+            };
           }
+        } else {
+          draft_removed = true;
         }
       }
       return {

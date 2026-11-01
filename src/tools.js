@@ -57,7 +57,7 @@ export const TOOLS = [
     scope: SCOPES.read,
     handler: mail.searchEmails,
     annotations: READ,
-    description: "Search one folder (default INBOX), newest first. Filters combine with AND. Returns UIDs, sender, subject, date, read/flag state and whether there are attachments. \Deleted messages are hidden unless include_deleted is true. Does not mark anything as read.",
+    description: "Search one folder (default INBOX), newest first. Filters combine with AND. Returns UIDs, sender, subject, date, read/flag state and whether there are attachments. \\Deleted messages are hidden unless include_deleted is true. Does not mark anything as read.",
     inputSchema: obj({
       folder,
       query: { type: "string", description: "Text anywhere in the message (headers or body). Chinese is supported." },
