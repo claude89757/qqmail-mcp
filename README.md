@@ -1,156 +1,140 @@
 # qqmail-mcp
 
-A remote [Model Context Protocol](https://modelcontextprotocol.io) server that gives AI assistants (ChatGPT, Grok Bot, Cursor, Claude, …) access to **one QQ Mail mailbox** over IMAP and SMTP. It runs as a single Cloudflare Worker with a built-in OAuth 2.1 authorization server, and Cloudflare Access acts as the login screen.
+单个 QQ 邮箱的远程 Model Context Protocol 服务，运行于 Cloudflare Workers，通过 IMAP/SMTP 访问邮箱，使用 D1 保存 OAuth 状态。Cloudflare Access 验证所有者身份，服务自己的确认页面负责批准具体客户端及权限。
 
-Hosted instance used by the author: **`https://qqmail.zacks.vision/mcp`**
+**当前版本：2.0.4。** 作者实例：`https://qqmail.zacks.vision/mcp`。
 
-[中文说明](#中文快速说明)
+[2026-11-01 发布与验收记录](docs/acceptance-2026-11-01.md)
 
-## Features
+## 工具与权限
 
-| Tool | Scope | What it does |
+| 工具 | 权限 | 行为与重要限制 |
 | --- | --- | --- |
-| `check_mail_connection` | `mail:read` | IMAP (and optionally SMTP) login check, INBOX counts, server capabilities |
-| `list_folders` | `mail:read` | All folders, including Chinese names, with total and unread counts and special-use roles (sent, drafts, trash, junk) |
-| `search_emails` | `mail:read` | Search any folder by text, from, to, subject, date range, unread or starred; newest first, paginated |
-| `read_email` | `mail:read` | Headers, flags, body as text or HTML, and attachment list. Never marks the message as read |
-| `list_attachments` | `mail:read` | Part numbers, filenames, types, approximate sizes |
-| `download_attachment` | `mail:read` | Inline base64 (images come back as image content), or a short-lived HTTPS link that streams files of any size |
-| `set_email_flags` | `mail:modify` | Read/unread, star/unstar, answered |
-| `move_emails` | `mail:modify` | Move between folders (uses `MOVE` when available; otherwise `COPY` + `\Deleted` + targeted cleanup). Without UIDPLUS, temporarily clears unrelated `\Deleted` flags, EXPUNGEs (CLOSE fallback), restores them, and verifies removal. Returns `source_expunged` / `pending_expunge` / `expunge_cleared_blockers`. |
-| `delete_emails` | `mail:modify` | Move to Trash; `permanent: true` (or deleting from Trash) expunges |
-| `save_draft` | `mail:modify` | Save or replace a draft in Drafts |
-| `send_email` | `mail:send` | Send through `smtp.qq.com:465` with cc, bcc, HTML and attachments |
-| `reply_email` | `mail:send` | Threaded reply (`In-Reply-To`/`References`), quotes the original, optional reply-all; optional `to` override (self-sent / only-self defaults to your address); marks the original as answered |
-| `forward_email` | `mail:send` | Forward with a note; original attachments are passed through |
-| `send_draft` | `mail:send` | Send a draft from Drafts (Bcc stripped from the content) and remove it |
+| `check_mail_connection` | `mail:read` | IMAP 登录、文件夹/收件箱统计；可选 SMTP 登录，不发送邮件 |
+| `list_folders` | `mail:read` | 中文文件夹、特殊用途、总数与未读数 |
+| `search_emails` | `mail:read` | 解码后主题/发件人/收件人、日期、标记、文本和 HTML 正文；条件 AND 组合；检查 `partial` |
+| `read_email` | `mail:read` | 正文、附件、状态与回复关联；不标记已读；空白纯文本部分可回退到 HTML |
+| `list_attachments` | `mail:read` | 部件编号、中文文件名、类型与估算大小 |
+| `download_attachment` | `mail:read` | 小附件内联，或限时链接流式下载；列表大小是估算值，不是内容完整性校验 |
+| `set_email_flags` | `mail:modify` | 已读/未读、星标/取消星标、已回复 |
+| `move_emails` | `mail:modify` | 优先服务器 MOVE，否则 COPY 后标记源邮件删除；不能安全定向清理时返回 `pending_expunge` |
+| `delete_emails` | `mail:modify` | 默认移入垃圾箱；请求永久删除也不能绕过安全清理限制 |
+| `save_draft` | `mail:modify` | 创建或替换草稿；新草稿与旧草稿的物理清理是不同结果 |
+| `send_email` | `mail:send` | To/Cc/Bcc、纯文本/HTML、附件；Bcc 不出现在发送的正文头部 |
+| `reply_email` | `mail:send` | 回复/回复全部、可指定 To、可取消引用；返回 `original_marked_answered` |
+| `forward_email` | `mail:send` | 带/不带原附件转发；附件读取失败时取消发送，而不是静默漏附件 |
+| `send_draft` | `mail:send` | 默认发送后尝试清理；可保留草稿；同一草稿重复提交有数据库防重保护 |
 
-Other details:
+文件夹参数可以用 `inbox`、`sent`、`drafts`、`trash`、`junk`，或 `list_folders` 返回的中文显示名称。UID 只在所属文件夹内有效，移动后目标 UID 可能改变；请重新搜索目标文件夹。
 
-- Folder arguments accept display names (`其他文件夹/工作`) or the aliases `inbox`, `sent`, `drafts`, `trash`, `junk`. Names are converted to IMAP modified UTF-7 automatically.
-- Message bodies are fetched by MIME part, so large messages no longer fail. GBK, GB2312, GB18030 and RFC 2047/2231 headers and filenames are decoded.
-- Tool annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`) let clients such as ChatGPT ask for confirmation before writes.
+## 首次连接
 
-## Connect a client
+在支持远程 MCP OAuth 的客户端中使用上述 `/mcp` 地址，认证选择 OAuth。客户端需要动态注册，使用 PKCE S256；登录 Cloudflare Access 后，还须在 QQ 邮箱授权确认页面核对应用、回调地址和权限，再点击确认。
 
-Use the MCP URL **`https://qqmail.zacks.vision/mcp`** (or `https://<your-domain>/mcp` for your own deployment). Every client uses OAuth with dynamic client registration and PKCE; no API key is needed.
+仅接受已注册客户端和完全匹配的回调地址。当前不支持 Client ID Metadata Document，元数据明确返回 `client_id_metadata_document_supported:false`；HTTPS 形式的客户端 ID 本身不是可信凭证。
 
-- **ChatGPT**: Settings → Apps & Connectors → enable developer mode → create a connector. Set the MCP server URL to `https://qqmail.zacks.vision/mcp` and authentication to OAuth. ChatGPT opens the Cloudflare Access login and returns automatically.
-- **Grok Bot**: add a remote MCP server or connector with the URL `https://qqmail.zacks.vision/mcp` and choose OAuth.
-- **Cursor** (`~/.cursor/mcp.json`):
+Cursor 配置示例：
 
-  ```json
-  { "mcpServers": { "qqmail": { "url": "https://qqmail.zacks.vision/mcp" } } }
-  ```
+```json
+{"mcpServers":{"qqmail":{"url":"https://qqmail.zacks.vision/mcp"}}}
+```
 
-Clients that were connected to v1.x only hold the `mail:read` scope. Disconnect and reconnect them to get the modify and send tools.
+升级并不主动撤销已有可用令牌。旧客户端若仅有 `mail:read`，需重新授权才能获得修改/发送权限。客户端若缓存旧工具定义，需要刷新定义后才能使用新增的 `scan_before_uid` 参数。
 
-> The legacy `*.workers.dev` hostname is not protected by Cloudflare Access, so `/authorize` refuses requests on it. Existing tokens keep working there, but new connections must use the custom domain.
+## 搜索结果如何读取
 
-## Security model
+所有给出的条件保持 AND 语义；中文、英文都在解码后的文本上匹配。`since` 包含当天，`before` 不包含当天，按 IMAP INTERNALDATE 的日期筛选。正文搜索包括文本和 HTML 转文本，不包括附件文件内的文字。
 
-- **Single-owner mailbox.** The QQ authorization code (`QQ_APP_PASSWORD`) stays in a Worker secret and is never exposed to MCP clients.
-- **OAuth 2.1 authorization server** on the same origin: `/register` (RFC 7591 dynamic client registration), `/authorize`, `/token`, and RFC 8414 / RFC 9728 metadata. Only public clients with PKCE S256 are accepted. Access tokens live 24 hours; refresh tokens live 30 days and are rotated on every use. Only SHA-256 hashes of codes and tokens are stored in D1.
-- **Redirect allowlist.** Any `https://` URI, `cursor://anysphere.cursor-mcp/oauth/callback`, and `http://localhost` or `http://127.0.0.1` loopback. URIs with embedded credentials or fragments are rejected.
-- **Cloudflare Access gates `/authorize`.** The Access application covers only the `/authorize` path, and the Worker also verifies the `Cf-Access-Jwt-Assertion` JWT itself (RS256 signature, `aud`, `iss`, expiry, and an optional email allowlist). If Access is not configured, `/authorize` fails closed with a 503.
-- **Scopes.** `mail:read`, `mail:modify` and `mail:send`. Set `ENABLE_MODIFY=false` or `ENABLE_SEND=false` to remove those tools for every token immediately.
-- **Download links** are 256-bit random tokens, stored hashed, that expire after 15 minutes by default. They are served with `Content-Disposition: attachment`, a sandbox CSP, and `nosniff`. Active content types (HTML, SVG, XML, JS) are served as `application/octet-stream`.
-- **Prompt injection.** Email content is untrusted. The send tools tell the model to act only on explicit user requests, but you should still review write and send confirmations in your client.
+单次最多扫描 500 个候选，正文最多读取 64 封，每个文本部分最多 256 KiB，并设有工作时间预算，避免把邮件任务无限拉长。返回：
 
-## Deploy your own
+- `partial:false`、`total_is_exact:true`：本次候选范围已完整检查，`total` 有效。
+- `partial:true`、`total:null`：不完整，不能解释成“全邮箱没有更多结果”。`matched_in_scan` 仅是已扫描范围内的匹配数。
+- 同一已扫描窗口内用 `offset` 翻页；`has_more` 表示该窗口尚有匹配结果。
+- 有 `next_scan_before_uid` 时，将它作为下一次 `scan_before_uid`，并将 `offset` 重置为 0，继续较旧候选。
+- `truncated_bodies` 大于 0 时，未扫描的正文尾部不能通过普通候选翻页补齐；应定位邮件后使用 `read_email` 进一步检查。
 
-Prerequisites: a Cloudflare account, a domain on Cloudflare, and a QQ Mail account with IMAP/SMTP enabled (QQ Mail → Settings → Account → POP3/IMAP/SMTP → enable, then generate an **authorization code (授权码)**).
+默认隐藏 `\\Deleted` 邮件；只有显式 `include_deleted:true` 才包含它们。文件夹总数可能包括这些待清理邮件，所以与默认搜索数量不同不是必然的数据丢失。
+
+## QQ 删除限制：不以误删风险换取“成功”
+
+有些 QQ IMAP 会话不提供 MOVE/UIDPLUS。**服务绝不执行整个文件夹级别的 EXPUNGE 或 CLOSE，也不临时修改其他邮件的删除标记。** 无安全定向清理能力时，源邮件可能仅被标记删除、从 MCP 默认列表隐藏；其他邮箱客户端可能仍显示它。
+
+请检查 `source_expunged`、`pending_expunge`、`draft_removed` 和 `draft_hidden`，不要仅根据 `moved`、`moved_to_trash` 或 `sent` 推断物理删除成功。`permanently_deleted:0` 就是未完成永久清理，需要通过 QQ 邮箱自身界面处理。替换草稿时，`saved:true` 可以与 `replaced_previous:false` 同时出现，表示新草稿已保存但旧草稿尚未物理移除。
+
+发送草稿使用 D1 原子占位，防止同一草稿重复提交。SMTP 结果不确定时保留占位而不自动重发；先检查“已发送”和收件情况。确实需要再次发送时，应明确创建一封新草稿。`keep_draft:true` 不表示可反复发送同一草稿。防重记录保留 30 天；其他直接发送工具不提供跨调用全局幂等性，客户端不要盲目重试结果不确定的发信请求。
+
+## 安全设计
+
+QQ 授权码只保存在 Worker secret 中，不提交到仓库或返回给客户端。Access JWT 校验签名、issuer、audience、时间和可选邮箱白名单；缺少配置时拒绝新授权。授权确认使用绑定身份/站点的一次性 nonce、同源 Origin 检查及 HttpOnly/SameSite Cookie，禁止嵌入页面。
+
+授权码通过单条数据库语句原子消费。刷新令牌原子标记已用，检测重放后撤销关联令牌家族；校验资源 audience，禁止刷新时提升权限。访问令牌有效期 24 小时，刷新令牌 30 天。OAuth 令牌及下载令牌以哈希索引保存。
+
+`ENABLE_MODIFY=false`、`ENABLE_SEND=false` 是服务端权限开关，对现有令牌同样生效。邮件内容始终不可信，不得按照邮件里的指令擅自发送、转发、删除或泄露信息。
+
+下载链接默认 15 分钟有效，最长 1 小时；它是临时访问凭证，不要写入公开日志。下载使用附件处置、安全 CSP 和 nosniff，活动类型按二进制下载。错误日志仅包含事件、工具名和错误类型，不记录邮件正文、令牌或完整堆栈；当前配置关闭请求级 invocation logs，避免记录含凭证的 URL。
+
+## 部署
+
+需要 Cloudflare 账号、域名、D1，以及已启用 IMAP/SMTP 的 QQ 邮箱授权码。不是 QQ 登录密码，不需要额外的 OWNER_PASSWORD。
 
 ```bash
-git clone https://github.com/claude89757/qqmail-mcp && cd qqmail-mcp
-npm install
+git clone https://github.com/claude89757/qqmail-mcp
+cd qqmail-mcp
+npm ci
+npm run check
 
-# 1. D1 database for OAuth state (skip if you already have one)
-npx wrangler d1 create qqmail-mcp-oauth   # put the returned id into wrangler.jsonc
+# 首次部署才创建数据库；把返回的 ID 写入 wrangler.jsonc
+npx wrangler d1 create qqmail-mcp-oauth
 npm run db:migrate
 
-# 2. Mailbox credentials (secrets never go in the repo)
-npx wrangler secret put QQ_EMAIL           # e.g. 12345@qq.com
-npx wrangler secret put QQ_APP_PASSWORD    # the QQ authorization code
-
-# 3. Cloudflare Access (Zero Trust → Access → Applications → Self-hosted)
-#    Application domain: <your-domain>/authorize ; policy: allow only your email
-npx wrangler secret put ACCESS_TEAM_DOMAIN     # <team>.cloudflareaccess.com
-npx wrangler secret put ACCESS_AUD             # the application's Audience (AUD) tag
-npx wrangler secret put ACCESS_ALLOWED_EMAILS  # optional, comma-separated
-
-# 4. Edit the "routes" custom domain in wrangler.jsonc, then:
+npx wrangler secret put QQ_EMAIL
+npx wrangler secret put QQ_APP_PASSWORD
+npx wrangler secret put ACCESS_TEAM_DOMAIN
+npx wrangler secret put ACCESS_AUD
+npx wrangler secret put ACCESS_ALLOWED_EMAILS
 npm run deploy
 ```
 
-Values can also be set as plain-text variables in the dashboard. `wrangler.jsonc` sets `keep_vars: true`, so `wrangler deploy` will not delete them.
+Cloudflare Access 自托管应用只保护 `<your-domain>/authorize`，策略只允许所有者邮箱。不要把整个域名都套在 Access 登录页后面，否则 MCP 发现、令牌交换和限时下载会受影响。Worker 内部仍会重新验证 Access JWT，未经 Access 认证的其他入口不能签发授权。
 
-### Upgrading the existing v1.2.1 deployment
+更新已有实例时不要重建 D1，不要重置密钥。核对 Worker 名称、路由、D1 和密钥绑定；保留现有绑定。项目 `keep_vars:true` 保留已有变量。通过 API 发布时应使用严格绑定继承并在发布后读回核对。
 
-1. Before deploying v2, set `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` (and preferably `ACCESS_ALLOWED_EMAILS`). Without them, new authorizations return 503. Existing tokens and refresh tokens are not affected.
-2. `npm run deploy` deploys to the same Worker name (`qqmail-mcp`), custom domain, D1 binding and secrets.
-3. Reconnect ChatGPT, Grok Bot and Cursor to get the new scopes.
-4. Check `GET /health`. It should report `"version":"2.0.2"` and `"access_jwt_verification":true`.
+### 变量
 
-### Configuration reference
+| 名称 | 用途 / 默认值 |
+| --- | --- |
+| `QQ_EMAIL` | 邮箱地址，支持 qq.com / vip.qq.com / foxmail.com |
+| `QQ_APP_PASSWORD` | QQ 邮箱 IMAP/SMTP 授权码，必须作为 secret |
+| `QQ_DISPLAY_NAME` | 发信显示名，可选 |
+| `ACCESS_TEAM_DOMAIN` | `<team>.cloudflareaccess.com` |
+| `ACCESS_AUD` | Access 应用 audience |
+| `ACCESS_ALLOWED_EMAILS` | 建议设置所有者邮箱白名单，逗号分隔 |
+| `ENABLE_MODIFY` / `ENABLE_SEND` | 默认 true；可立即关闭相关功能 |
+| `SAVE_SENT_COPY` | 默认 false；当前作者实例 true。避免与 QQ 自动保存重复配置 |
+| `MAX_INLINE_ATTACHMENT_BYTES` | 默认 4 MiB |
+| `DOWNLOAD_TTL_SECONDS` | 默认 900，最大 3600 |
+| `ALLOW_INSECURE_LOCAL_AUTHORIZE` | 仅 localhost/127.0.0.1 本地开发；生产不要启用 |
 
-| Name | Kind | Default | Purpose |
-| --- | --- | --- | --- |
-| `QQ_EMAIL` | secret / var | — | Mailbox address (`qq.com`, `vip.qq.com`, `foxmail.com`) |
-| `QQ_APP_PASSWORD` | **secret** | — | QQ Mail authorization code |
-| `QQ_DISPLAY_NAME` | var | — | Display name in the `From:` header |
-| `ACCESS_TEAM_DOMAIN` | secret / var | — | `<team>.cloudflareaccess.com` |
-| `ACCESS_AUD` | secret / var | — | Access application audience tag |
-| `ACCESS_ALLOWED_EMAILS` | secret / var | — | Optional email allowlist checked against the Access JWT |
-| `ENABLE_MODIFY` | var | `true` | Enables the `mail:modify` tools |
-| `ENABLE_SEND` | var | `true` | Enables the `mail:send` tools |
-| `SAVE_SENT_COPY` | var | `false` | Default for `save_to_sent`. Turn it on if QQ Mail does not already keep SMTP-sent mail (QQ setting “SMTP发信后保存到服务器”) |
-| `MAX_INLINE_ATTACHMENT_BYTES` | var | `4194304` | Size limit for `download_attachment` with `mode: "base64"` |
-| `DOWNLOAD_TTL_SECONDS` | var | `900` | Download link lifetime (maximum 3600) |
-| `ALLOW_INSECURE_LOCAL_AUTHORIZE` | var | — | Local development only: skips the Access check on `localhost` |
+读取正文每部分最多 2 MiB，单 IMAP 会话有内存/大小限制。发信附件总计最多 20 MiB、10 个附件、50 个收件人；批量 UID 最多 100。链接采用流式下载，不代表任意大小、网络和时长均经过验收。
 
-### Limits
-
-The Worker caps each IMAP session at 48 MB and bodies read per part at 2 MB. Inline attachments are limited to 4 MB; download links have no size limit because they stream. Outgoing attachments may total 20 MB, with at most 50 recipients per message and at most 100 UIDs per bulk operation. Outbound port 25 is blocked on Workers, so SMTP uses implicit TLS on port 465.
-
-## Development
+## 开发、验收与发布检查
 
 ```bash
-npm install
-npm test                 # unit + end-to-end tests against in-memory IMAP/SMTP/D1 fakes
-cp .dev.vars.example .dev.vars   # fill in; set ALLOW_INSECURE_LOCAL_AUTHORIZE=true
+npm ci
+npm test
+npm run check                    # 测试 + Wrangler dry-run，不部署
+cp .dev.vars.example .dev.vars   # 只在本地填写；禁止提交
 npm run db:migrate:local
-npm run dev              # http://127.0.0.1:8787
-npm run smoke            # DCR → authorize → token → initialize → tools/list
-npm run smoke -- --live  # also logs in to QQ IMAP/SMTP with .dev.vars credentials
-npm run check            # tests + wrangler dry-run bundle
+npm run dev
+npm run smoke                   # 本地 DCR/显式确认/令牌/MCP 流程
+npm run smoke -- --live          # 另检查本地配置的真实 IMAP/SMTP
 ```
 
-Project layout:
+GitHub CI 对 push/PR 执行测试和打包检查。`scripts/apply-2.0.3.py`、`scripts/apply-2.0.4.py` 是本次升级的哈希保护一次性补丁，不是常规启动或安装步骤，不应在新版本上重复运行。
 
-```
-src/index.js       router (health, OAuth endpoints, /mcp, /download)
-src/oauth.js       OAuth 2.1 AS: DCR, authorize, token, scopes
-src/access.js      Cloudflare Access JWT verification
-src/mcp.js         JSON-RPC / Streamable HTTP handler
-src/tools.js       tool schemas, annotations, scopes
-src/mail.js        tool implementations
-src/imap.js        IMAP client (literals, MOVE/UIDPLUS fallbacks, verified EXPUNGE without UIDPLUS, streaming fetch)
-                   Note: QQ Mail often lacks UIDPLUS and may return empty DELETED searches. We verify
-                   after EXPUNGE/CLOSE; unrelated \Deleted flags are cleared only for the EXPUNGE
-                   window then restored so other trash is not wiped.
-src/imap-parse.js  response parser, BODYSTRUCTURE, modified UTF-7
-src/mime.js        header decoding, HTML→text, message builder
-src/smtp.js        SMTP client (AUTH LOGIN, dot-stuffing)
-src/download.js    short-lived attachment links
-```
+常规发布顺序：固定提交 → 测试通过 → 备份版本号/核对绑定 → 部署同名 Worker → `/health` 检查版本及 ready → 未授权请求应为 401 → QQ 自发自收验收 → 对照“已发送”和收件正文/附件 → 仅清理测试样本。记录 Worker version ID 和源提交，回滚优先选择最近安全且可用的版本，不回滚到已知授权/误删风险版本。
 
-## 中文快速说明
-
-- **连接地址**：在 ChatGPT（开发者模式 → 创建连接器）、Grok Bot 或 Cursor 中填写 `https://qqmail.zacks.vision/mcp`，认证方式选 OAuth。登录页由 Cloudflare Access 提供，只允许邮箱所有者登录。
-- **功能**：文件夹与未读数、搜索（支持中文）、阅读、附件下载（内联或临时链接）、标记已读/未读/星标、移动、删除、草稿，以及通过 SMTP 发送、回复、转发。
-- **权限**：`mail:read`、`mail:modify`、`mail:send` 三个作用域。可用 `ENABLE_MODIFY=false` 或 `ENABLE_SEND=false` 随时关闭写入或发信。从 v1.x 升级后需要重新连接客户端才能获得新权限。
-- **部署**：`QQ_APP_PASSWORD` 填 QQ 邮箱的“授权码”（不是登录密码），必须用 `wrangler secret put` 设置，不要提交到仓库。升级前先设置 `ACCESS_TEAM_DOMAIN` 和 `ACCESS_AUD`。
+`src/index.js` 路由；`oauth.js`/`access.js`/`store.js` 授权；`mcp.js`/`tools.js` MCP；`mail.js` 业务；`imap.js`/`smtp.js` 协议；`mime.js`/`imap-parse.js`/`bytes.js` 编解码；`download.js` 限时下载。具体发布证据和未覆盖的边界场景见验收记录。
 
 ## License
 
