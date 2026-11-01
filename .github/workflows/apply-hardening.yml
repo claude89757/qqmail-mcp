@@ -1,0 +1,51 @@
+name: Apply reviewed 2.0.3 hardening
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/apply-2.0.3.py']
+permissions:
+  contents: write
+concurrency:
+  group: apply-qqmail-hardening
+  cancel-in-progress: false
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: python3 scripts/apply-2.0.3.py
+      - run: npm ci
+      - run: npm run check
+      - name: Commit only after tests and bundle validation
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src test scripts/smoke-local.mjs package.json package-lock.json wrangler.jsonc
+          git commit -m 'fix: ship 2.0.3 OAuth consent, atomic tokens, reliable search and safe cleanup'
+          git push origin HEAD:main
+          git rev-parse HEAD > RELEASE_COMMIT.txt
+      - name: Auditable tested source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qqmail-hardened-source
+          retention-days: 7
+          path: |
+            src/
+            test/
+            scripts/
+            migrations/
+            package.json
+            package-lock.json
+            vitest.config.js
+            wrangler.jsonc
+            README.md
+            dist/
+            RELEASE_COMMIT.txt
