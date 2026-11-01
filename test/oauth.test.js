@@ -136,7 +136,11 @@ describe("OAuth flow end to end", () => {
     const { client_id } = await reg.json();
     const { verifier, challenge } = await pkce();
     const q = new URLSearchParams({ response_type: "code", client_id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", state: "st", resource: `${ORIGIN}/mcp`, ...(scope ? { scope } : {}) });
-    const auth = await route(new Request(`${ORIGIN}/authorize?${q}`), e, { verifyAccess: async () => ({ ok: true, email: "owner@example.com" }) });
+    const deps = { verifyAccess: async () => ({ ok: true, email: "owner@example.com" }) };
+    const page = await route(new Request(`${ORIGIN}/authorize?${q}`), e, deps);
+    expect(page.status).toBe(200);
+    const nonce = /name="consent" value="([^"]+)"/.exec(await page.text())[1];
+    const auth = await route(new Request(`${ORIGIN}/authorize`, { method: "POST", headers: { Origin: ORIGIN, Cookie: page.headers.get("Set-Cookie").split(";")[0] }, body: new URLSearchParams({ consent: nonce, decision: "allow" }) }), e, deps);
     expect(auth.status).toBe(302);
     const loc = new URL(auth.headers.get("Location"));
     expect(loc.searchParams.get("state")).toBe("st");
@@ -153,7 +157,7 @@ describe("OAuth flow end to end", () => {
     const t = await connectClient(e);
     expect(t.scope).toBe("mail:read mail:modify mail:send");
     const init = await (await rpc(e, t.access_token, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).json();
-    expect(init.result.serverInfo).toMatchObject({ name: "qqmail-mcp", version: "2.0.2" });
+    expect(init.result.serverInfo).toMatchObject({ name: "qqmail-mcp", version: "2.0.3" });
     const list = await (await rpc(e, t.access_token, "tools/list")).json();
     expect(list.result.tools).toHaveLength(TOOLS.length);
   });

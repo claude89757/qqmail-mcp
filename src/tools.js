@@ -60,7 +60,7 @@ export const TOOLS = [
     description: "Search one folder (default INBOX), newest first. Filters combine with AND. Returns UIDs, sender, subject, date, read/flag state and whether there are attachments. \\Deleted messages are hidden unless include_deleted is true. Does not mark anything as read.",
     inputSchema: obj({
       folder,
-      query: { type: "string", description: "Text anywhere in the message (headers or body). Chinese is supported." },
+      query: { type: "string", description: "Text in decoded message headers or text/HTML body, not attachment file contents. Chinese is supported. Check partial and total_is_exact." },
       from: { type: "string" },
       to: { type: "string" },
       subject: { type: "string" },
@@ -70,6 +70,7 @@ export const TOOLS = [
       flagged_only: { type: "boolean" },
       limit: { type: "integer", minimum: 1, maximum: LIMITS.searchMax, default: 10 },
       offset: { type: "integer", minimum: 0, default: 0, description: "Skip this many newest matches (pagination)." },
+      scan_before_uid: { type: "integer", minimum: 1, description: "Continue an incomplete scan using next_scan_before_uid from the previous result; reset offset to zero." },
       include_deleted: {
         type: "boolean",
         default: false,

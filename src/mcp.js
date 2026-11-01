@@ -24,7 +24,7 @@ export async function callTool(ctx, auth, name, args) {
     return { result: { content: [{ type: "text", text: JSON.stringify(value) }], isError: false } };
   } catch (e) {
     const message = e instanceof MailError ? e.message : "Mail operation failed unexpectedly. Try again.";
-    if (!(e instanceof MailError)) console.error("tool error", name, e?.stack || e);
+    console.error(JSON.stringify({ event: "tool_error", tool: name, error_type: e?.name || "Error" }));
     return { result: { content: [{ type: "text", text: JSON.stringify({ error: message }) }], isError: true } };
   }
 }

@@ -278,118 +278,26 @@ export class ImapSession {
     return [];
   }
 
-  /**
-   * Removes the given UIDs that are flagged \Deleted.
-   * Prefers UID EXPUNGE (UIDPLUS). Without UIDPLUS:
-   *   1) ensures \Deleted is set on our UIDs,
-   *   2) temporarily clears \Deleted on unrelated deleted messages,
-   *   3) runs mailbox EXPUNGE (and CLOSE if needed),
-   *   4) restores unrelated \Deleted flags,
-   *   5) verifies our UIDs are gone before claiming success.
-   * Returns { expunged, expunge_method, pending_expunge, blocked_by?, note? }.
-   */
+  /** Only targeted UID EXPUNGE is safe with concurrent IMAP clients. Never EXPUNGE/CLOSE a folder. */
   async uidExpunge(uids) {
-    const list = [...new Set((uids || []).map(Number).filter((n) => n > 0))];
+    const list = [...new Set((uids || []).map(Number).filter(n => n > 0))];
     if (!list.length) return { expunged: true, expunge_method: "none", pending_expunge: [] };
-
     if (this.has("UIDPLUS")) {
-      await this.command(`UID EXPUNGE ${uidSet(list)}`);
-      const left = await this.uidsStillPresent(list);
-      if (!left.length) return { expunged: true, expunge_method: "uid_expunge", pending_expunge: [] };
-      // Fall through — some servers advertise UIDPLUS but ignore UID EXPUNGE.
-    }
-
-    const want = new Set(list);
-    const flagRows = await this.uidFetch(list, "UID FLAGS");
-    const missingFlag = list.filter((u) => {
-      const row = flagRows.get(u);
-      return row ? !this.flagsHaveDeleted(row) : false;
-    });
-    if (missingFlag.length) await this.uidStore(missingFlag, "+", ["\\Deleted"]);
-
-    let deleted = null;
-    try {
-      deleted = await this.uidSearch("DELETED");
-    } catch {
-      deleted = null;
-    }
-    const blockers = Array.isArray(deleted) ? deleted.filter((u) => !want.has(u)) : [];
-    const emptyDeletedSearch = Array.isArray(deleted) && !deleted.length;
-    // QQ may hide \Deleted from SEARCH DELETED and FETCH. Track whether FETCH saw our UIDs.
-    const qqHidingDeleted = emptyDeletedSearch && list.some((u) => !flagRows.has(u));
-    let method = emptyDeletedSearch ? "expunge_empty_deleted_search" : "expunge";
-    let note = emptyDeletedSearch
-      ? "Server returned no DELETED hits after STORE (common on QQ Mail); issued mailbox EXPUNGE with verification."
-      : undefined;
-
-    const selected = this.selected;
-    const existsBefore = selected?.exists ?? null;
-    let restored = true;
-    if (blockers.length) {
-      await this.uidStore(blockers, "-", ["\\Deleted"]);
-      restored = false;
-    }
-    try {
-      await this.command("EXPUNGE");
-      let left = await this.uidsStillPresent(list);
-      if (left.length && selected) {
-        try {
-          await this.command("CLOSE");
-        } catch {
-          /* CLOSE may fail if already deselected */
-        }
+      try {
+        await this.command(`UID EXPUNGE ${uidSet(list)}`);
+        // Re-select and compare both targeted SEARCH and FETCH before claiming success.
+        const selected = this.selected;
         this.selected = null;
-        await this.open(selected.raw, { write: true });
-        if (blockers.length) {
-          await this.uidStore(blockers, "-", ["\\Deleted"]).catch(() => {});
-          await this.command("EXPUNGE").catch(() => {});
-        }
-        left = await this.uidsStillPresent(list);
-        if (!left.length) method = method === "expunge" ? "close" : `${method}+close`;
-      }
-      if (left.length) {
-        return {
-          expunged: false,
-          expunge_method: "none",
-          pending_expunge: left,
-          ...(blockers.length ? { blocked_by: blockers } : {}),
-          note:
-            "Source message(s) remain after EXPUNGE/CLOSE. QQ Mail often lacks UIDPLUS; cleanup was verified and did not remove them.",
-        };
-      }
-      if (qqHidingDeleted) {
-        const existsAfter = this.selected?.exists ?? null;
-        const dropped =
-          existsBefore != null && existsAfter != null && existsAfter <= existsBefore - list.length;
-        if (!dropped) {
-          return {
-            expunged: false,
-            expunge_method: "none",
-            pending_expunge: list,
-            note:
-              "QQ Mail hid \\Deleted from SEARCH/FETCH so EXPUNGE could not be verified (EXISTS unchanged). Messages left flagged and hidden from default search.",
-          };
-        }
-      }
-      return {
-        expunged: true,
-        expunge_method: method,
-        pending_expunge: [],
-        ...(note ? { note } : {}),
-        ...(blockers.length ? { expunge_cleared_blockers: blockers.length } : {}),
-      };
-    } finally {
-      if (blockers.length && !restored) {
-        try {
-          if (!this.selected && selected) await this.open(selected.raw, { write: true });
-          // Only restore blockers that still exist.
-          const still = await this.uidsStillPresent(blockers);
-          if (still.length) await this.uidStore(still, "+", ["\\Deleted"]);
-        } catch {
-          /* best-effort restore */
-        }
+        if (selected) await this.open(selected.raw, { write: true });
+        const left = await this.uidsStillPresent(list);
+        if (!left.length) return { expunged: true, expunge_method: "uid_expunge", pending_expunge: [] };
+        return { expunged: false, expunge_method: "none", pending_expunge: left, note: "Targeted cleanup did not remove every UID. No folder-wide cleanup was attempted." };
+      } catch {
+        // Fail closed: a failed targeted operation never falls back to mailbox EXPUNGE.
       }
     }
+    return { expunged: false, expunge_method: "none", pending_expunge: list,
+      note: "Safe targeted expunge is unavailable. Messages remain flagged Deleted and hidden from default search; no other messages were touched. Use QQ Mail to finish permanent cleanup." };
   }
 
   /** APPENDs a message; returns the new UID when the server reports APPENDUID (UIDPLUS). */

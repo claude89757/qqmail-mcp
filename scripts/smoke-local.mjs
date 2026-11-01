@@ -9,7 +9,10 @@ const redirect = "http://localhost:6274/oauth/callback";
 
 const reg = await (await fetch(`${BASE}/register`, { method: "POST", body: JSON.stringify({ client_name: "smoke", redirect_uris: [redirect] }) })).json();
 const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", state: "s1" });
-const auth = await fetch(`${BASE}/authorize?${q}`, { redirect: "manual" });
+const page = await fetch(`${BASE}/authorize?${q}`, { redirect: "manual" });
+if (page.status !== 200) throw new Error(`Consent page returned ${page.status}`);
+const nonce = /name="consent" value="([^"]+)"/.exec(await page.text())[1];
+const auth = await fetch(`${BASE}/authorize`, { method: "POST", redirect: "manual", headers: { Origin: BASE, Cookie: page.headers.get("set-cookie").split(";")[0] }, body: new URLSearchParams({ consent: nonce, decision: "allow" }) });
 if (auth.status !== 302) throw new Error(`/authorize returned ${auth.status}: ${await auth.text()}`);
 const code = new URL(auth.headers.get("location")).searchParams.get("code");
 const tok = await (await fetch(`${BASE}/token`, { method: "POST", body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: reg.client_id, redirect_uri: redirect, code_verifier: verifier }) })).json();

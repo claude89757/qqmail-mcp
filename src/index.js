@@ -41,7 +41,7 @@ export default {
     try {
       return await route(req, env);
     } catch (e) {
-      console.error("unhandled", e?.stack || e);
+      console.error(JSON.stringify({ event: "unhandled", error_type: e?.name || "Error" }));
       return err("Internal service error", 500);
     }
   },

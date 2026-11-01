@@ -12,6 +12,7 @@
   // Plain-text vars set in the dashboard (e.g. QQ_EMAIL, ACCESS_*) survive `wrangler deploy`.
   // Keep personal values out of this public file; set them with `wrangler secret put` or the dashboard.
   "keep_vars": true,
+  "observability": { "enabled": true, "head_sampling_rate": 1, "logs": { "enabled": true, "invocation_logs": false } },
 
   "d1_databases": [
     {

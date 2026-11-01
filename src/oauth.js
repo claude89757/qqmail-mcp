@@ -57,7 +57,7 @@ export function metadata(origin, env) {
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
     scopes_supported: [...enabledScopes(env), OFFLINE_SCOPE],
-    client_id_metadata_document_supported: true,
+    client_id_metadata_document_supported: false,
   };
 }
 
@@ -84,12 +84,8 @@ export async function validClient(env, id, redirect) {
   if (!redirectAllowed(redirect) || typeof id !== "string" || !id || id.length > 600) return false;
   const saved = await store(env).get("client:" + id, "json");
   if (saved) return Array.isArray(saved.redirect_uris) && saved.redirect_uris.includes(redirect);
-  try {
-    const u = new URL(id);
-    return u.protocol === "https:" && !u.username && !u.password;
-  } catch {
-    return false;
-  }
+  // URL-shaped IDs are not proof of client ownership. Use registered clients only.
+  return false;
 }
 
 export async function register(req, env) {
@@ -128,32 +124,57 @@ export async function checkAuthQuery(url, env, origin) {
   return { clientId, redirectUri, challenge, state, scope };
 }
 
-/** /authorize: Cloudflare Access is the login and consent step; the Worker re-verifies its JWT. */
-export async function authorize(req, env, origin, deps = {}) {
-  if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
-  const access = await (deps.verifyAccess || verifyAccess)(req, env);
-  if (!access.ok) return oauthErr(access.status === 503 ? "server_error" : "access_denied", access.reason, access.status);
-  let p;
-  try {
-    p = await checkAuthQuery(new URL(req.url), env, origin);
-  } catch (e) {
-    return oauthErr("invalid_request", e.message);
-  }
-  const code = random();
-  await store(env).put("code:" + (await sha(code)), JSON.stringify(p), { expirationTtl: CODE_TTL });
-  const url = new URL(p.redirectUri);
-  url.searchParams.set("code", code);
-  if (p.state) url.searchParams.set("state", p.state);
-  return new Response(null, { status: 302, headers: { ...NO_CACHE, Location: url.toString() } });
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
-async function issue(env, scope, clientId) {
+/** Access authenticates the owner; a separate, CSRF-protected POST grants consent. */
+export async function authorize(req, env, origin, deps = {}) {
+  if (!["GET", "POST"].includes(req.method)) return json({ error: "Method not allowed" }, 405);
+  const access = await (deps.verifyAccess || verifyAccess)(req, env);
+  if (!access.ok) return oauthErr(access.status === 503 ? "server_error" : "access_denied", access.reason, access.status);
+  const s = store(env);
+  const cookieName = new URL(origin).protocol === "https:" ? "__Host-qqmcp-consent" : "qqmcp-consent";
+  const cookieFlags = `Path=/; HttpOnly; SameSite=Lax${new URL(origin).protocol === "https:" ? "; Secure" : ""}`;
+  let p;
+  if (req.method === "GET") {
+    try { p = await checkAuthQuery(new URL(req.url), env, origin); }
+    catch (e) { return oauthErr("invalid_request", e.message); }
+    const nonce = random();
+    await s.put("consent:" + await sha(nonce), { ...p, owner: access.email, origin }, { expirationTtl: CODE_TTL });
+    const client = await s.get("client:" + p.clientId, "json");
+    const html = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>QQ 邮箱授权确认</title><body><main><h1>允许应用访问你的 QQ 邮箱？</h1><p>应用：<strong>${escapeHtml(client?.client_name || p.clientId)}</strong></p><p>回调地址：<code>${escapeHtml(p.redirectUri)}</code></p><p>请求权限：<strong>${escapeHtml(p.scope)}</strong></p><p>mail:read 可读取邮件；mail:modify 可修改、移动和删除；mail:send 可发送邮件。仅批准你主动连接且信任的应用。</p><form method="post" action="/authorize"><input type="hidden" name="consent" value="${escapeHtml(nonce)}"><button name="decision" value="allow" type="submit">确认授权</button> <button name="decision" value="deny" type="submit">拒绝</button></form></main></body></html>`;
+    return new Response(html, { headers: { ...NO_CACHE, "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'", "X-Frame-Options": "DENY", "Set-Cookie": `${cookieName}=${nonce}; ${cookieFlags}; Max-Age=${CODE_TTL}` } });
+  }
+  if (req.headers.get("Origin") !== origin) return oauthErr("access_denied", "Consent origin mismatch", 403);
+  let form;
+  try { form = await req.formData(); } catch { return oauthErr("invalid_request", "Invalid consent form"); }
+  const nonce = String(form.get("consent") || "");
+  const cookie = (req.headers.get("Cookie") || "").split(";").map(x => x.trim()).find(x => x.startsWith(cookieName + "="))?.slice(cookieName.length + 1) || "";
+  if (!nonce || !cookie || !constantTimeEqual(nonce, cookie)) return oauthErr("access_denied", "Consent cookie mismatch", 403);
+  const key = "consent:" + await sha(nonce);
+  p = await s.get(key, "json");
+  if (!p || p.owner !== access.email || p.origin !== origin) return oauthErr("access_denied", "Consent expired or identity changed", 403);
+  if (!(await s.consume(key))) return oauthErr("access_denied", "Consent already used", 403);
+  const headers = { ...NO_CACHE, "Set-Cookie": `${cookieName}=; ${cookieFlags}; Max-Age=0` };
+  const url = new URL(p.redirectUri);
+  if (form.get("decision") === "allow") {
+    if (!(await validClient(env, p.clientId, p.redirectUri))) return oauthErr("invalid_client", "Client no longer registered");
+    const code = random();
+    await s.put("code:" + await sha(code), { ...p, resource: resource(origin) }, { expirationTtl: CODE_TTL });
+    url.searchParams.set("code", code);
+  } else url.searchParams.set("error", "access_denied");
+  if (p.state) url.searchParams.set("state", p.state);
+  return new Response(null, { status: 302, headers: { ...headers, Location: url.toString() } });
+}
+
+async function issue(env, scope, clientId, audience, family = random()) {
   const access = random();
   const refresh = random();
   const s = store(env);
   await Promise.all([
-    s.put("access:" + (await sha(access)), JSON.stringify({ scope, clientId }), { expirationTtl: ACCESS_TTL }),
-    s.put("refresh:" + (await sha(refresh)), JSON.stringify({ scope, clientId }), { expirationTtl: REFRESH_TTL }),
+    s.put("access:" + (await sha(access)), JSON.stringify({ scope, clientId, resource: audience, family }), { expirationTtl: ACCESS_TTL }),
+    s.put("refresh:" + (await sha(refresh)), JSON.stringify({ scope, clientId, resource: audience, family }), { expirationTtl: REFRESH_TTL }),
     s.purgeExpired().catch(() => {}),
   ]);
   return json({ access_token: access, refresh_token: refresh, token_type: "Bearer", expires_in: ACCESS_TTL, scope });
@@ -176,15 +197,28 @@ export async function token(req, env, origin) {
     const verifier = String(p.get("code_verifier") || "");
     if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier) || !constantTimeEqual(await sha(verifier), v.challenge)) return oauthErr("invalid_grant", "PKCE validation failed");
     if (p.get("resource") && p.get("resource") !== resource(origin)) return oauthErr("invalid_target", "Resource mismatch");
-    await s.delete(key);
-    return issue(env, v.scope, clientId);
+    if (!(await s.consume(key))) return oauthErr("invalid_grant", "Code already used");
+    return issue(env, v.scope, clientId, v.resource || resource(origin));
   }
   if (grant === "refresh_token") {
     const key = "refresh:" + (await sha(String(p.get("refresh_token") || "")));
     const v = await s.get(key, "json");
     if (!v || v.clientId !== clientId) return oauthErr("invalid_grant", "Refresh token expired");
-    await s.delete(key);
-    return issue(env, v.scope, clientId);
+    if (p.get("resource") && p.get("resource") !== resource(origin)) return oauthErr("invalid_target", "Resource mismatch");
+    if (v.resource && v.resource !== resource(origin)) return oauthErr("invalid_target", "Token audience mismatch");
+    const family = v.family || await sha(key);
+    if (await s.get("revoked:" + family)) return oauthErr("invalid_grant", "Token family revoked");
+    let scope = v.scope;
+    if (p.get("scope")) {
+      const requested = String(p.get("scope")).trim().split(/\s+/);
+      if (!requested.includes(SCOPES.read) || requested.some(x => !v.scope.split(/\s+/).includes(x))) return oauthErr("invalid_scope", "Scope escalation refused");
+      scope = [...new Set(requested)].join(" ");
+    }
+    if (!(await s.useRefresh(key, family))) {
+      await s.put("revoked:" + family, "1", { expirationTtl: 2 * REFRESH_TTL });
+      return oauthErr("invalid_grant", "Refresh replay detected; reconnect this client");
+    }
+    return issue(env, scope, clientId, v.resource || resource(origin), family);
   }
   return oauthErr("unsupported_grant_type", "Expected authorization_code or refresh_token");
 }
@@ -196,6 +230,8 @@ export async function authenticate(req, env) {
   const data = await store(env).get("access:" + (await sha(m[1])), "json");
   const scopes = String(data?.scope || "").split(/\s+/);
   if (!scopes.includes(SCOPES.read)) return null;
+  if (data.resource && data.resource !== resource(new URL(req.url).origin)) return null;
+  if (data.family && await store(env).get("revoked:" + data.family)) return null;
   const enabled = enabledScopes(env);
   return { clientId: data.clientId, scopes: scopes.filter((s) => enabled.includes(s)) };
 }

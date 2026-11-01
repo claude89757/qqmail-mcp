@@ -88,10 +88,11 @@ describe("read tools", () => {
     expect(r.results[0]).toMatchObject({ seen: true, has_attachments: false });
   });
 
-  it("sends non-ASCII search text as a UTF-8 literal", async () => {
+  it("matches decoded Chinese body without a server TEXT index", async () => {
     const r = await call("search_emails", { query: "开会", unread_only: true });
-    expect(r.results.map((x) => x.uid)).toEqual([101]);
-    expect(imap.commands.find((c) => c.includes("UID SEARCH"))).toMatch(/UID SEARCH CHARSET UTF-8 ALL TEXT \u0000 UNSEEN/);
+    expect(r.results.map(x => x.uid)).toEqual([101]);
+    expect(r.partial).toBe(false);
+    expect(imap.commands.some(c => /UID SEARCH.*CHARSET/.test(c))).toBe(false);
   });
 
   it("paginates with offset", async () => {
@@ -170,25 +171,16 @@ describe("modify tools", () => {
     expect(imap.folders.INBOX.messages.map((m) => m.uid)).toEqual([101]);
   });
 
-  it("without UIDPLUS uses safe mailbox EXPUNGE when only our messages are deleted", async () => {
-    imap.caps = "IMAP4rev1";
-    const r = await call("move_emails", { uids: [102], destination: "junk" });
-    expect(r).toMatchObject({ moved: 1, move_method: "copy", source_expunged: true, expunge_method: "expunge", pending_expunge: [] });
-    expect(imap.commands.some((c) => /\bEXPUNGE$/.test(c))).toBe(true);
-    expect(imap.folders.INBOX.messages.map((m) => m.uid)).toEqual([101]);
-    expect(imap.folders.Junk.messages).toHaveLength(1);
-  });
-
-  it("without UIDPLUS temporarily clears other deleted flags then EXPUNGEs", async () => {
+  it("without UIDPLUS never EXPUNGEs or CLOSEs a whole folder", async () => {
     imap.caps = "IMAP4rev1";
     imap.find("INBOX", 101).flags.add("\\Deleted");
     const r = await call("move_emails", { uids: [102], destination: "junk" });
-    expect(r).toMatchObject({ moved: 1, move_method: "copy", source_expunged: true, expunge_method: "expunge", pending_expunge: [] });
-    expect(r.expunge_cleared_blockers).toBe(1);
-    expect(imap.folders.INBOX.messages.map((m) => m.uid)).toEqual([101]);
+    expect(r).toMatchObject({ moved: 1, move_method: "copy", source_expunged: false, pending_expunge: [102] });
+    expect(imap.folders.INBOX.messages.map(m => m.uid)).toEqual([101, 102]);
     expect(imap.find("INBOX", 101).flags.has("\\Deleted")).toBe(true);
     expect(imap.folders.Junk.messages).toHaveLength(1);
-    expect(imap.commands.some((c) => c.includes("-FLAGS.SILENT"))).toBe(true);
+    expect(imap.commands.some(c => / (EXPUNGE|CLOSE)$/.test(c))).toBe(false);
+    expect(imap.commands.some(c => c.includes("-FLAGS.SILENT"))).toBe(false);
   });
 
   it("deletes to Trash, then permanently from Trash", async () => {
@@ -297,22 +289,16 @@ describe("send tools", () => {
     expect(imap.folders.Drafts.messages).toHaveLength(0);
   });
 
-  it("removes a draft via safe EXPUNGE when UIDPLUS is absent", async () => {
-    imap.caps = "IMAP4rev1";
-    await call("save_draft", { to: ["ann@example.com"], subject: "NoUidplus", body: "x" });
-    const r = await call("send_draft", { uid: 1 });
-    expect(r).toMatchObject({ sent: true, draft_removed: true, expunge_method: "expunge", pending_expunge: [] });
-    expect(imap.folders.Drafts.messages).toHaveLength(0);
-    expect(imap.commands.some((c) => /\bEXPUNGE$/.test(c))).toBe(true);
-  });
-
-    it("still EXPUNGEs when DELETED search returns empty (QQ quirk)", async () => {
+  it("leaves a sent draft hidden and blocks duplicate sends without UIDPLUS", async () => {
     imap.caps = "IMAP4rev1";
     imap.emptyDeletedSearch = true;
-    await call("save_draft", { to: ["ann@example.com"], subject: "EmptyDeletedSearch", body: "x" });
+    await call("save_draft", { to: ["ann@example.com"], subject: "SafePending", body: "x" });
     const r = await call("send_draft", { uid: 1 });
-    expect(r).toMatchObject({ sent: true, draft_removed: true, expunge_method: "expunge_empty_deleted_search", pending_expunge: [] });
-    expect(imap.folders.Drafts.messages).toHaveLength(0);
+    expect(r).toMatchObject({ sent: true, draft_removed: false, draft_hidden: true, source_expunged: false, pending_expunge: [1] });
+    expect(imap.folders.Drafts.messages).toHaveLength(1);
+    expect(imap.commands.some(c => / (EXPUNGE|CLOSE)$/.test(c))).toBe(false);
+    expect((await call("send_draft", { uid: 1 })).error).toMatch(/already sent/);
+    expect(smtp.sent).toHaveLength(1);
   });
 
   it("reports pending_expunge when EXPUNGE is a no-op (QQ)", async () => {
@@ -322,7 +308,7 @@ describe("send tools", () => {
     await call("save_draft", { to: ["ann@example.com"], subject: "NoopExpunge", body: "x" });
     const r = await call("send_draft", { uid: 1 });
     expect(r.sent).toBe(true);
-    expect(r.draft_removed).toBe(true); // soft: flagged \Deleted, hidden from default search
+    expect(r.draft_removed).toBe(false); // Physical deletion is not falsely claimed.
     expect(r.source_expunged).toBe(false);
     expect(r.pending_expunge).toContain(1);
     expect(imap.folders.Drafts.messages).toHaveLength(1);

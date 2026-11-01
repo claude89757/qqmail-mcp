@@ -1,3 +1,5 @@
+import { store } from "./store.js";
+import { sha } from "./oauth.js";
 import { base64Decode, base64Encode, binaryToBytes, bytesToBinary, decodeTransfer, enc, isValidBase64 } from "./bytes.js";
 import { LIMITS, flag } from "./config.js";
 import { MailError } from "./errors.js";
@@ -49,7 +51,7 @@ export function uidsOf(args) {
 export function imapDate(s, field) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s))) throw new MailError(`${field} must be YYYY-MM-DD`);
   const d = new Date(s + "T00:00:00Z");
-  if (!Number.isFinite(d.getTime())) throw new MailError(`Invalid ${field} date`);
+  if (!Number.isFinite(d.getTime()) || d.toISOString().slice(0, 10) !== s) throw new MailError(`Invalid ${field} date`);
   return `${d.getUTCDate()}-${MONTHS[d.getUTCMonth()]}-${d.getUTCFullYear()}`;
 }
 
@@ -268,58 +270,62 @@ export async function listFolders(ctx, args) {
 export async function searchEmails(ctx, args) {
   const limit = intIn(args.limit, 1, LIMITS.searchMax, 10);
   const offset = intIn(args.offset, 0, 1_000_000, 0);
-  const criteria = searchCriteria(args);
-  const needle = clean(args.query || args.subject || args.from || args.to || "", 200);
-  return withImap(ctx.env, ctx.connect, async (s) => {
+  if (args.since) imapDate(args.since, "since");
+  if (args.before) imapDate(args.before, "before");
+  const needles = Object.fromEntries(["query", "from", "to", "subject"].map(k => [k, clean(args[k], 200).toLowerCase()]));
+  const textSearch = Object.values(needles).some(Boolean);
+  return withImap(ctx.env, ctx.connect, async s => {
     const box = await s.open(args.folder);
-
-  const includeDeleted = !!args.include_deleted;
-  const dropDeleted = async (uids) => {
-    if (includeDeleted || !uids.length) return uids;
-    const rows = await s.uidFetch(uids, "UID FLAGS");
-    return uids.filter((u) => {
-      const row = rows.get(u);
-      if (!row) return false;
-      return !flagsOf(row).deleted;
-    });
-  };
-
-    let ids;
-    try {
-      ids = await dropDeleted(await s.uidSearch(...criteria));
-    } catch (e) {
-      // QQ Mail often rejects CHARSET UTF-8 / sync literals. Fall back to a recent-window client filter.
-      if (!needle) throw e;
-      const recent = await s.uidSearch("ALL");
-      const window = recent.slice(-Math.min(recent.length, Math.max(limit * 20, 80)));
-      if (!window.length) return { folder: box.name, total: 0, count: 0, offset, results: [], note: "Chinese search fell back to client filter; no messages." };
-      const rows = await s.uidFetch(window, SUMMARY_ITEMS);
-            const matched = window.filter((u) => {
-        if (!rows.has(u)) return false;
-        const row = summary(u, rows.get(u));
-        const hay = `${row.subject}\n${row.from}\n${row.to}`.toLowerCase();
-        return hay.includes(needle.toLowerCase());
-      });
-      const matchedLive = await dropDeleted(matched);
-      const end = Math.max(0, matchedLive.length - offset);
-      const page = matchedLive.slice(Math.max(0, end - limit), end).reverse();
-      const results = page.filter((u) => rows.has(u)).map((u) => summary(u, rows.get(u)));
-      return {
-        folder: box.name,
-        total: matchedLive.length,
-        count: results.length,
-        offset,
-        has_more: end - limit > 0,
-        results,
-        note: "Chinese IMAP SEARCH unavailable on this server; filtered recent subjects/from/to locally.",
-      };
+    // Numeric/date/flag criteria remain server-side. Text is checked against decoded MIME locally.
+    let ids = await s.uidSearch(...searchCriteria({ since: args.since, before: args.before, unread_only: args.unread_only, flagged_only: args.flagged_only }));
+    if (args.scan_before_uid !== undefined) ids = ids.filter(u => u < uidOf(args.scan_before_uid));
+    const candidates = ids.length;
+    const window = ids.slice(-500).reverse();
+    const matches = [];
+    let scanned = 0, lastUid = null, bodyReads = 0, truncatedBodies = 0;
+    const deadline = Date.now() + 18000;
+    const dateKey = value => {
+      const m = /^(\d{1,2})-([A-Za-z]{3})-(\d{4})/.exec(str(value));
+      return m ? `${m[3]}-${String(MONTHS.findIndex(x => x.toLowerCase() === m[2].toLowerCase()) + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}` : "";
+    };
+    outer: for (let i = 0; i < window.length; i += 25) {
+      if (Date.now() >= deadline) break;
+      const batch = window.slice(i, i + 25);
+      const rows = await s.uidFetch(batch, SUMMARY_ITEMS);
+      for (const uid of batch) {
+        if (Date.now() >= deadline) break outer;
+        const attrs = rows.get(uid);
+        if (!attrs) { scanned++; lastUid = uid; continue; }
+        const row = summary(uid, attrs);
+        const day = dateKey(attrs.INTERNALDATE);
+        let include = (args.include_deleted || !row.deleted) && (!args.unread_only || !row.seen) && (!args.flagged_only || row.flagged);
+        if (args.since) include &&= !!day && day >= args.since;
+        if (args.before) include &&= !!day && day < args.before;
+        for (const key of ["from", "to", "subject"]) if (needles[key]) include &&= String(row[key]).toLowerCase().includes(needles[key]);
+        if (include && needles.query) {
+          const headers = headerMap(attrs, "HEADER.FIELDS");
+          if (!Object.values(headers).join("\n").toLowerCase().includes(needles.query)) {
+            if (bodyReads >= 64) break outer;
+            bodyReads++;
+            const parts = flattenBodyStructure(attrs.BODYSTRUCTURE || []);
+            const body = await loadBodies(s, uid, parts, { wantHtml: true, maxBytes: 256 * 1024 });
+            if (body.truncated) truncatedBodies++;
+            include = `${body.text}\n${htmlToText(body.html)}`.toLowerCase().includes(needles.query);
+          }
+        }
+        scanned++; lastUid = uid;
+        if (include) matches.push(row);
+      }
     }
-    const end = Math.max(0, ids.length - offset);
-    const page = ids.slice(Math.max(0, end - limit), end).reverse();
-    if (!page.length) return { folder: box.name, total: ids.length, count: 0, offset, results: [] };
-    const rows = await s.uidFetch(page, SUMMARY_ITEMS);
-    const results = page.filter((u) => rows.has(u)).map((u) => summary(u, rows.get(u)));
-    return { folder: box.name, total: ids.length, count: results.length, offset, has_more: end - limit > 0, results };
+    const remaining = candidates > scanned;
+    const partial = remaining || truncatedBodies > 0;
+    const results = matches.slice(offset, offset + limit);
+    return { folder: box.name, total: partial ? null : matches.length, total_is_exact: !partial,
+      matched_in_scan: matches.length, count: results.length, offset, has_more: offset + limit < matches.length,
+      partial, scanned, candidates, body_reads: bodyReads, truncated_bodies: truncatedBodies,
+      ...(remaining && lastUid ? { next_scan_before_uid: lastUid } : {}), results,
+      ...(textSearch ? { search_mode: "decoded_local_and_body" } : {}),
+      ...(partial ? { note: "Partial scan, not an exhaustive result. Page through matches with offset; continue older candidates with scan_before_uid and offset=0. Body search covers up to 256 KiB per text part, not attachment file contents." } : {}) };
   });
 }
 
@@ -343,6 +349,8 @@ export async function readEmail(ctx, args) {
       reply_to: h["reply-to"] || "",
       date: h.date || str(attrs.INTERNALDATE),
       message_id: h["message-id"] || "",
+      in_reply_to: h["in-reply-to"] || "",
+      references: h.references || "",
       ...flagsOf(attrs),
       size_bytes: Number(attrs["RFC822.SIZE"]) || 0,
       body_format: format,
@@ -591,11 +599,14 @@ export async function replyEmail(ctx, args) {
       const subject = prefixSubject(h.subject || "", "re");
       const message = buildMessage({ from: fromHeader(ctx.env), to, cc, subject, text, html, attachments, inReplyTo: msgId || undefined, references: refs || undefined });
       const r = await deliver(ctx, s, { message, envelope: envelopeOf({ to, cc, bcc }), saveToSent: saveSentDefault(ctx.env, args.save_to_sent) });
+      let original_marked_answered = false;
       try {
+        s.selected = null;
         await s.open(box.name, { write: true });
         await s.uidStore([uid], "+", ["\\Answered"]);
+        original_marked_answered = flagsOf((await s.uidFetch([uid], "UID FLAGS")).get(uid) || {}).answered;
       } catch {}
-      return { ...r, in_reply_to_uid: uid, subject, to: to.map(formatAddressForDisplay), cc: cc.map(formatAddressForDisplay), bcc_count: bcc.length };
+      return { ...r, original_marked_answered, in_reply_to_uid: uid, subject, to: to.map(formatAddressForDisplay), cc: cc.map(formatAddressForDisplay), bcc_count: bcc.length };
     },
     { timeoutMs: LIMITS.sendTimeoutMs }
   );
@@ -643,7 +654,8 @@ export async function forwardEmail(ctx, args) {
           const fetched = (await s.uidFetch([uid], "UID " + atts.map((p) => `BODY.PEEK[${p.fetch_section}]`).join(" "))).get(uid) || {};
           for (const p of atts) {
             const raw = bodySection(fetched, p.fetch_section);
-            if (raw != null) rawParts.push(forwardPart(p, raw instanceof Uint8Array ? raw : enc.encode(str(raw))));
+            if (raw == null) throw new MailError("An original attachment could not be read; forwarding was cancelled before sending");
+            rawParts.push(forwardPart(p, raw instanceof Uint8Array ? raw : enc.encode(str(raw))));
           }
         }
       }
@@ -663,8 +675,9 @@ export async function sendDraft(ctx, args) {
     ctx.connect,
     async (s) => {
       const box = await s.open("drafts", { write: true });
-      const meta = (await s.uidFetch([uid], "UID RFC822.SIZE")).get(uid);
+      const meta = (await s.uidFetch([uid], "UID FLAGS RFC822.SIZE")).get(uid);
       if (!meta) throw new MailError(`Draft UID ${uid} not found in ${box.name}`);
+      if (flagsOf(meta).deleted) throw new MailError("Draft is deleted or already sent; do not retry. Create a new draft to send again.");
       if (Number(meta["RFC822.SIZE"]) > LIMITS.rawDraftBytes) throw new MailError("Draft is too large to send from the Worker");
       const raw = bodySection((await s.uidFetch([uid], "UID BODY.PEEK[]")).get(uid) || {}, "");
       if (!(raw instanceof Uint8Array)) throw new MailError("Could not load the draft");
@@ -672,9 +685,20 @@ export async function sendDraft(ctx, args) {
       const h = parseHeaders(decodeUnknown(binaryToBytes(splitHeaderBody(binary)[0])));
       const rcpt = recipientsOf({ to: h.to || [], cc: h.cc || [], bcc: h.bcc || [] });
       const outgoing = binaryToBytes(removeHeader(binary, "Bcc"));
-      const r = await deliver(ctx, s, { message: outgoing, envelope: envelopeOf(rcpt), saveToSent: saveSentDefault(ctx.env, args.save_to_sent) });
-      let cleanup = { expunged: true, expunge_method: "none", pending_expunge: [] };
-      let draft_removed = true;
+      const sendKey = "draft-send:" + await sha(ctx.env.QQ_EMAIL + "\n" + (h["message-id"] || binary));
+      const saved = store(ctx.env);
+      if (!(await saved.claim(sendKey, { state: "sending" }, 30 * 86400))) throw new MailError("This draft was already submitted for sending. Check Sent before retrying; create a new draft for an intentional resend.");
+      let r;
+      try {
+        r = await deliver(ctx, s, { message: outgoing, envelope: envelopeOf(rcpt), saveToSent: saveSentDefault(ctx.env, args.save_to_sent) });
+      } catch (e) {
+        throw new MailError("Draft delivery was not confirmed. The send lock is retained to prevent duplicates. Check Sent before creating a new draft.", { cause: e });
+      }
+      await saved.put(sendKey, { state: "sent" }, { expirationTtl: 30 * 86400 }).catch(() => {});
+      let cleanup = { expunged: false, expunge_method: "retained_by_request", pending_expunge: [], note: "Draft retained by explicit request." };
+      let draft_removed = false;
+      let draft_hidden = false;
+      try {
       if (!args.keep_draft) {
         // Force re-SELECT: APPEND to Sent can leave the session stale on QQ Mail.
         s.selected = null;
@@ -708,7 +732,8 @@ export async function sendDraft(ctx, args) {
           let left = await s.uidSearch(`UID ${uidSet(existing)}`);
           if (left.length) {
             await s.uidStore(left, "+", ["\\Deleted"]);
-            draft_removed = true; // soft-hide via search filter
+            draft_removed = false;
+            draft_hidden = true; // Explicitly distinguish hidden from physically removed.
             cleanup = {
               ...cleanup,
               expunged: false,
@@ -725,6 +750,10 @@ export async function sendDraft(ctx, args) {
         }
       }
 
+      } catch {
+        cleanup = { expunged: false, expunge_method: "none", pending_expunge: [uid], note: "Mail was sent, but draft cleanup failed. Do not resend." };
+        draft_removed = false;
+      }
       return {
         ...r,
         draft_uid: uid,
@@ -733,6 +762,7 @@ export async function sendDraft(ctx, args) {
         cc: rcpt.cc.map(formatAddressForDisplay),
         bcc_count: rcpt.bcc.length,
         draft_removed,
+        draft_hidden,
         ...cleanupFields(cleanup),
       };
     },

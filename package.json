@@ -1,6 +1,6 @@
 {
   "name": "qqmail-mcp",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "private": true,
   "description": "Remote MCP server for QQ Mail (IMAP + SMTP) on Cloudflare Workers, with built-in OAuth 2.1 + PKCE gated by Cloudflare Access.",
   "license": "MIT",
