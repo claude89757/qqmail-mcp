@@ -81,10 +81,11 @@ export function makeMessage({ headers, parts, flags = [], internalDate = "01-Nov
 // IMAP
 
 export class FakeImapServer {
-  constructor({ user, password, folders, caps = "IMAP4rev1 MOVE UIDPLUS" }) {
+  constructor({ user, password, folders, caps = "IMAP4rev1 MOVE UIDPLUS", emptyDeletedSearch = false }) {
     this.user = user;
     this.password = password;
     this.caps = caps;
+    this.emptyDeletedSearch = emptyDeletedSearch;
     this.folders = {};
     for (const [name, def] of Object.entries(folders)) {
       this.folders[name] = { flags: def.flags || [], nextUid: 1, messages: [] };
@@ -223,7 +224,7 @@ class FakeImapSession {
       let msgs = folder().messages;
       if (/\bUNSEEN\b/.test(upper)) msgs = msgs.filter((m) => !m.flags.has("\\Seen"));
       if (/\bFLAGGED\b/.test(upper)) msgs = msgs.filter((m) => m.flags.has("\\Flagged"));
-      if (/\bDELETED\b/.test(upper)) msgs = msgs.filter((m) => m.flags.has("\\Deleted"));
+      if (/\bDELETED\b/.test(upper)) msgs = s.emptyDeletedSearch ? [] : msgs.filter((m) => m.flags.has("\\Deleted"));
       const uidm = /\bUID ([\d,:]+)/.exec(cmdLine.slice(10));
       if (uidm) msgs = msgs.filter((m) => parseSet(uidm[1]).includes(m.uid));
       const hm = /HEADER Message-ID ("(?:[^"\\]|\\.)*")/i.exec(cmdLine);

@@ -307,6 +307,15 @@ describe("send tools", () => {
     expect(imap.commands.some((c) => /\bEXPUNGE$/.test(c))).toBe(true);
   });
 
+  it("still EXPUNGEs when DELETED search returns empty (QQ quirk)", async () => {
+    imap.caps = "IMAP4rev1";
+    imap.emptyDeletedSearch = true;
+    await call("save_draft", { to: ["ann@example.com"], subject: "EmptyDeletedSearch", body: "x" });
+    const r = await call("send_draft", { uid: 1 });
+    expect(r).toMatchObject({ sent: true, draft_removed: true, expunge_method: "expunge_empty_deleted_search", pending_expunge: [] });
+    expect(imap.folders.Drafts.messages).toHaveLength(0);
+  });
+
   it("surfaces SMTP authentication failures", async () => {
     smtp.password = "different";
     expect((await call("send_email", { to: ["a@b.com"], subject: "x", body: "y" })).error).toMatch(/SMTP login failed/);

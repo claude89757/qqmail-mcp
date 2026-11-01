@@ -258,19 +258,35 @@ export class ImapSession {
       await this.command(`UID EXPUNGE ${uidSet(list)}`);
       return { expunged: true, expunge_method: "uid_expunge", pending_expunge: [] };
     }
-    const deleted = await this.uidSearch("DELETED");
     const want = new Set(list);
-    const blockedBy = deleted.filter((u) => !want.has(u));
-    if (blockedBy.length) {
-      return { expunged: false, expunge_method: "none", pending_expunge: list.filter((u) => deleted.includes(u) || want.has(u)), blocked_by: blockedBy };
+    let deleted = null;
+    try {
+      deleted = await this.uidSearch("DELETED");
+    } catch {
+      deleted = null;
     }
-    // Safe: every \Deleted message in this mailbox is one we intend to remove.
-    if (deleted.length) {
-      await this.command("EXPUNGE");
-      return { expunged: true, expunge_method: "expunge", pending_expunge: [] };
+    if (Array.isArray(deleted) && deleted.length) {
+      const blockedBy = deleted.filter((u) => !want.has(u));
+      if (blockedBy.length) {
+        return {
+          expunged: false,
+          expunge_method: "none",
+          pending_expunge: list.filter((u) => deleted.includes(u) || want.has(u)),
+          blocked_by: blockedBy,
+        };
+      }
     }
-    // STORE may have failed silently or UIDs were already gone.
-    return { expunged: false, expunge_method: "none", pending_expunge: list };
+    // QQ Mail often omits UIDPLUS and returns an empty DELETED search even after STORE.
+    // When SEARCH reports nothing (or only our UIDs), run mailbox EXPUNGE so ghosts clear.
+    await this.command("EXPUNGE");
+    return {
+      expunged: true,
+      expunge_method: Array.isArray(deleted) && deleted.length ? "expunge" : "expunge_empty_deleted_search",
+      pending_expunge: [],
+      ...(Array.isArray(deleted) && !deleted.length
+        ? { note: "Server returned no DELETED hits after STORE (common on QQ Mail); issued mailbox EXPUNGE anyway." }
+        : {}),
+    };
   }
 
   /** APPENDs a message; returns the new UID when the server reports APPENDUID (UIDPLUS). */

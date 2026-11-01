@@ -416,11 +416,12 @@ function cleanupFields(r) {
     pending_expunge: r.pending_expunge || [],
   };
   if (r.blocked_by?.length) out.expunge_blocked_by = r.blocked_by;
-  if (!expunged) {
+  if (r.note) out.note = r.note;
+  else if (!expunged) {
     out.note =
-      "Source message(s) were flagged \\Deleted but not expunged. " +
+      "Source message(s) were flagged \Deleted but not expunged. " +
       (r.blocked_by?.length
-        ? "Mailbox already had other \\Deleted messages; a full EXPUNGE would remove those too, so cleanup was skipped (QQ Mail often lacks UIDPLUS)."
+        ? "Mailbox already had other \Deleted messages; a full EXPUNGE would remove those too, so cleanup was skipped (QQ Mail often lacks UIDPLUS)."
         : "Server did not support a targeted expunge (no UIDPLUS) and no safe mailbox EXPUNGE was possible.");
   }
   return out;
