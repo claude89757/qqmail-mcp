@@ -1,0 +1,38 @@
+{
+  "name": "qqmail-mcp",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Remote MCP server for QQ Mail (IMAP + SMTP) on Cloudflare Workers, with built-in OAuth 2.1 + PKCE gated by Cloudflare Access.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787 --ip 127.0.0.1 --compatibility-date 2026-10-30 --local-upstream 127.0.0.1:8787",
+    "db:migrate:local": "wrangler d1 migrations apply OAUTH_DB --local",
+    "db:migrate": "wrangler d1 migrations apply OAUTH_DB --remote",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke-local.mjs",
+    "dry-run": "wrangler deploy --dry-run --outdir dist",
+    "check": "vitest run && wrangler deploy --dry-run --outdir dist",
+    "deploy": "vitest run && wrangler deploy"
+  },
+  "devDependencies": {
+    "vitest": "^5.0.5",
+    "wrangler": "^4.156.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/claude89757/qqmail-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "qq-mail",
+    "imap",
+    "smtp",
+    "cloudflare-workers",
+    "oauth"
+  ]
+}

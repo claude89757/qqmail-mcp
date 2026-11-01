@@ -1,0 +1,13 @@
+# Copy to .dev.vars for `wrangler dev`. Never commit the real file.
+QQ_EMAIL=you@qq.com
+# QQ Mail "authorization code" (授权码) from Settings > Account > POP3/IMAP/SMTP, not your login password.
+QQ_APP_PASSWORD=replace-me
+
+# Cloudflare Access in front of /authorize (Zero Trust > Access > Applications).
+ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com
+ACCESS_AUD=replace-with-application-audience-tag
+# Optional comma-separated allowlist checked against the Access JWT email claim.
+ACCESS_ALLOWED_EMAILS=you@example.com
+
+# Local development only: skip the Access JWT check on http://localhost.
+# ALLOW_INSECURE_LOCAL_AUTHORIZE=true

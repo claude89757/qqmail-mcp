@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "qqmail-mcp",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+
+  // Matches the existing production Worker: Custom Domain plus the legacy workers.dev URL.
+  // /authorize on workers.dev is refused in code because Cloudflare Access only fronts the custom domain.
+  "workers_dev": true,
+  "routes": [{ "pattern": "qqmail.zacks.vision", "custom_domain": true }],
+
+  // Plain-text vars set in the dashboard (e.g. QQ_EMAIL, ACCESS_*) survive `wrangler deploy`.
+  // Keep personal values out of this public file; set them with `wrangler secret put` or the dashboard.
+  "keep_vars": true,
+
+  "d1_databases": [
+    {
+      "binding": "OAUTH_DB",
+      "database_name": "qqmail-mcp-oauth",
+      "database_id": "7f8a504b-4e01-4a1f-b696-e9cccfd98117",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
